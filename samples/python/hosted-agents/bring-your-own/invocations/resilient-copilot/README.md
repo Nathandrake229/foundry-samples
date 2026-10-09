@@ -89,10 +89,11 @@ This agent supports two LLM backends (same selection logic as the
 ## Run it locally
 
 ```bash
-pip install -r src/resilient-copilot/requirements.txt
+cd src/resilient-copilot
+uv sync            # creates .venv from pyproject.toml and uv.lock
 az login   # for the BYOK Foundry-model path (Managed Identity)
-cp src/resilient-copilot/.env.example src/resilient-copilot/.env  # then edit
-python src/resilient-copilot/main.py   # listens on http://localhost:8088
+cp .env.example .env  # then edit
+uv run python main.py   # listens on http://localhost:8088
 ```
 
 ### 1) Stream a turn (with reconnect)

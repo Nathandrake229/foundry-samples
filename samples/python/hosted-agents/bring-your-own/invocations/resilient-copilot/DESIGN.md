@@ -83,7 +83,7 @@ samples/python/hosted-agents/bring-your-own/invocations/resilient-copilot/
     ├── main.py                     # HTTP surface: POST / GET-SSE / elicit / cancel
     ├── agent.py                    # the resilient @task: owns Copilot session lifecycle
     ├── copilot_session.py          # Copilot SDK harness (create/resume, event pump, elicit bridge)
-    ├── requirements.txt            # azure-ai-agentserver-invocations, github-copilot-sdk, azure-identity
+    ├── pyproject.toml, uv.lock, uv.toml   # azure-ai-agentserver-invocations, github-copilot-sdk, azure-identity
     ├── Dockerfile  .env.example  .dockerignore  .azdignore
 internal/tools/samples-hosted-agents/python/bring-your-own/invocations/resilient-copilot/test-spec.yml
 ```
@@ -253,7 +253,7 @@ One-liner: **Copilot = durable steerable brain; task = durable, self-healing, si
 ## BUILD LOG (2026-08-11T20:xx)
 Built **resilient-copilot** (invocations) on branch `sample/resilient-copilot`. Files:
 - `azure.yaml`, `README.md`, `AGENTS.md`, `CLAUDE.md`
-- `src/resilient-copilot/`: `main.py`, `agent.py`, `copilot_session.py`, `requirements.txt`, `Dockerfile`, `.env.example`, `.dockerignore`, `.azdignore`
+- `src/resilient-copilot/`: `main.py`, `agent.py`, `copilot_session.py`, `pyproject.toml`, `uv.lock`, `uv.toml`, `Dockerfile`, `.env.example`, `.dockerignore`, `.azdignore`
 - `internal/tools/samples-hosted-agents/python/bring-your-own/invocations/resilient-copilot/test-spec.yml` (owner namantyagi; validates + plans applicable)
 
 Design decisions locked during build:

@@ -20,6 +20,8 @@ not:
 * **Durable HITL marker** — when the model raises an elicitation, we persist a
   marker in an explicit ``FoundryStateStore`` so the human-in-the-loop pause is
   re-drivable after a crash even though the in-memory Future is gone.
+* **Todo checkpoints** — after a tool changes the todo list, dependencies or
+  plan file, save a live session snapshot before acknowledging the tool hook.
 
 Steering (``send(mode="immediate")``) and queueing (``send(mode="enqueue")``)
 are delivered *directly to the live Copilot session* from ``main.py`` while a
@@ -44,10 +46,10 @@ from azure.ai.agentserver.core.streaming import streams
 from azure.ai.agentserver.core.tasks import TaskContext, multi_turn_task
 
 try:
-    from .copilot_session import CopilotHarness
+    from .copilot_session import CopilotHarness, TodoCheckpointRequest
     from .store import SessionSnapshotStore
 except ImportError:  # allow `python main.py` from inside this directory
-    from copilot_session import CopilotHarness
+    from copilot_session import CopilotHarness, TodoCheckpointRequest
     from store import SessionSnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -234,6 +236,31 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
             async for event in harness.events():
                 if ctx.cancel.is_set() or ctx.shutdown.is_set():
                     break
+                if isinstance(event, TodoCheckpointRequest):
+                    try:
+                        await _SNAPSHOT_STORE.save(session_id, config_dir, live=True)
+                        state["has_snapshot"] = True
+                        state["todo_fingerprint"] = event.fingerprint
+                        await state_store.set_item("state", state)
+                        logger.info(
+                            "copilot_todo_checkpoint_saved session=%s fingerprint=%s",
+                            session_id,
+                            event.fingerprint,
+                        )
+                        await emit(
+                            {
+                                "type": "todo_checkpoint",
+                                "fingerprint": event.fingerprint,
+                            }
+                        )
+                    except Exception as exc:
+                        if not event.acknowledged.done():
+                            event.acknowledged.set_exception(exc)
+                        raise
+                    else:
+                        if not event.acknowledged.done():
+                            event.acknowledged.set_result(None)
+                    continue
                 await emit(_event_payload(event))
                 _maybe_crash(seq)
         finally:
@@ -244,7 +271,6 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
             await harness.abort()
             await emit({"type": "cancelled"})
         else:
-            await emit({"type": "turn_complete"})
             # Turn finished cleanly — clear any answered elicitation marker.
             if state.get("pending_elicitation"):
                 state["pending_elicitation"] = None
@@ -255,12 +281,11 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
         # config_dir into the StateStore so the conversation survives a
         # container replacement. Keep only a tiny reference in the state store.
         await harness.close()
-        try:
-            await _SNAPSHOT_STORE.save(session_id, config_dir)
-            state["has_snapshot"] = True
-            await state_store.set_item("state", state)
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("failed to snapshot Copilot session %s", session_id)
+        await _SNAPSHOT_STORE.save(session_id, config_dir)
+        state["has_snapshot"] = True
+        await state_store.set_item("state", state)
+        if clean_completion:
+            await emit({"type": "turn_complete"})
 
         # Close the wire stream so SSE subscribers see the terminator. NOT done
         # on the crash path below: the stream must stay open for the recovery

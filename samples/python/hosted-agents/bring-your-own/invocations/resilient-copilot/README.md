@@ -25,7 +25,8 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 | Capability | What it gives you | How it works here |
 |---|---|---|
 | **Long-running / no-ingress survival** | Work keeps running past idle-eviction even with no client connected. | While the Copilot agent grinds through a (possibly minutes-long) tool loop, the task is `in_progress`, so the platform keeps the container alive. |
-| **Crash recovery** | A restarted container resumes the conversation from disk. | On `ctx.entry_mode == "recovered"` the task calls `resume_session(session_id)` (the Copilot CLI persisted the session workspace) and re-drives the turn, emitting a `recovered` marker onto the same stream. |
+| **Crash recovery** | A replacement container restores the latest saved Copilot session. | On recovered entry, the task restores the session snapshot from `FoundryStateStore` before calling `resume_session(session_id)` and re-driving the prompt. Uncheckpointed work can repeat. |
+| **Todo/plan checkpoints** | Todo progress is saved during a turn, not just at its end. | After a tool changes todo rows, dependencies or `plan.md`, a post-tool hook waits for a live session snapshot. The stream emits `todo_checkpoint` after persistence succeeds. |
 | **Steering** | A new input redirects the in-flight turn instead of racing it. | `POST` with `{"mode":"immediate"}` while a turn is active → `session.send(prompt, mode="immediate")` on the live Copilot session. |
 | **Queueing** | A follow-up input runs after the current turn. | `POST` with `{"mode":"enqueue"}` → `session.send(prompt, mode="enqueue")`. |
 | **Streaming with reconnect** | Clients reconnect after a drop or crash with no gap. | Every Copilot `SessionEvent` is emitted onto a **file-backed** replay stream with a monotonic `sequence_number`; reconnect via `GET … ?last_event_id=N`. |
@@ -143,12 +144,42 @@ curl -X POST http://localhost:8088/elicit \
 ## Testing crash recovery
 
 Set `SIMULATE_CRASH_AFTER_EVENTS=N` and start a streaming turn. The process
-**hard-crashes** (`os._exit(1)`) right after the Nth event is checkpointed —
+**hard-crashes** (`os._exit(1)`) right after the Nth event is written to the replay stream —
 identical, from the task's perspective, to a SIGKILL/OOM. On restart the
 framework re-invokes the task with `entry_mode="recovered"`, calls
 `resume_session`, emits a `recovered` marker, and continues on the **same**
 file-backed stream, so a client reconnecting via `?last_event_id=N` sees the
 pre-crash events + `recovered` + the continuation.
+
+### Todo checkpoint boundaries
+
+Multiple todos can complete in one Copilot turn. Completing a todo does not
+end the turn or create another Foundry task. This sample preserves that behavior
+and saves the session after each detected todo/plan change.
+
+The pinned CLI stores todos in the session workspace's `session.db`. The
+post-tool hook compares the `todos` and `todo_deps` rows and `plan.md` with the
+last acknowledged state. Read-only queries do not create another snapshot.
+The task handles the checkpoint in its own request context and acknowledges the
+hook only after saving the snapshot and marker. Checkpoint failures fail the
+turn rather than claiming progress was saved.
+
+Live snapshots use SQLite's online backup API, so committed todo rows in an
+active WAL are included without copying active database sidecars. An incomplete
+JSONL tail is omitted. Each database is consistent independently; this is not
+an atomic snapshot across all files or an exactly-once guarantee for tool effects.
+Recovery re-drives the prompt with the saved plan, rather than resuming a live
+instruction pointer.
+
+The latest snapshot is also saved after the client closes. In hosted execution
+it is a State Store item; offline execution uses a local archive. Snapshot
+retention remains one hour from its latest write.
+
+Run the focused tests from the sample root:
+
+```bash
+uv run --project src/resilient-copilot python -m unittest discover -s tests -v
+```
 
 > **Why `os._exit` and not a "simulate shutdown" flag?** Crash recovery is the
 > lease-expiry path and must be exercised with a real abrupt exit. A handler

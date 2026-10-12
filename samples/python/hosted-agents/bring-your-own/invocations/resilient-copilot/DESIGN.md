@@ -204,6 +204,22 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
 - `ctx.shutdown` — real SIGTERM → clean break; optional `exit_for_recovery()` for next-lifetime resumption.
 - `ctx.input` / `ctx.input_id` — `{prompt, session_id, invocation_id, call_id}`; preserved verbatim on recovered re-entry.
 
+### Todo-level snapshots within a turn
+
+The post-tool hook reads a fingerprint of the pinned CLI's session todo and
+dependency tables, plus `plan.md`. A change enqueues a checkpoint request to
+the task's event consumer and waits for acknowledgement. The consumer writes
+a live session snapshot, updates the State Store marker, and emits
+`todo_checkpoint`. A persistence error fails the turn; the hook is not treated
+as a best-effort durability fence.
+
+SQLite databases are captured with online backup so committed WAL changes
+survive restoration into a fresh directory. Database sidecars and lock files
+are excluded from live snapshots, and partial JSONL records are omitted.
+This is not an atomic cross-file snapshot and does not checkpoint arbitrary
+external side effects. Todo status transitions do not split a Copilot turn:
+one turn may create and finish multiple todos, with multiple snapshots.
+
 **Deviation & rationale:** steering/queueing go DIRECTLY to the live Copilot session, not the framework steering queue:
 ```python
 run = await get_task_manager().get_active_run(task_id)

@@ -19,7 +19,7 @@ and SDK-version-agnostic. It owns:
   marker). The client's answer resolves the Future so the callback returns an
   ``ElicitationResult`` and the model continues.
 
-The sample pins the Copilot SDK version in ``requirements.txt`` so the imports
+The sample pins the Copilot SDK version in ``uv.lock`` so the imports
 and callback contracts remain reproducible.
 """
 
@@ -30,10 +30,23 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from copilot import CopilotClient, PermissionHandler, ProviderConfig
+from copilot import (
+    CopilotClient,
+    PermissionHandler,
+    PostToolUseHookInput,
+    PostToolUseHookOutput,
+    ProviderConfig,
+)
 from copilot.session_events import SessionEventType
+
+try:
+    from .store import todo_fingerprint
+except ImportError:
+    from store import todo_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +57,12 @@ ElicitRequestCallback = Callable[[str, str, dict], Awaitable[None]]
 
 # Sentinel end-of-stream marker pushed onto the queue when the agent goes idle.
 _IDLE = object()
+
+
+@dataclass
+class TodoCheckpointRequest:
+    fingerprint: str | None
+    acknowledged: asyncio.Future[None]
 
 
 class CopilotHarness:
@@ -57,6 +76,10 @@ class CopilotHarness:
         # elicitation_id -> Future[ElicitationResult]
         self._pending_elicitations: dict[str, asyncio.Future] = {}
         self._on_elicit_request: ElicitRequestCallback | None = None
+        self._workspace: Path | None = None
+        self._todo_fingerprint: str | None = None
+        self._checkpoint_lock = asyncio.Lock()
+        self._pending_checkpoints: set[asyncio.Future[None]] = set()
 
     # -- backend selection ---------------------------------------------------
 
@@ -138,6 +161,7 @@ class CopilotHarness:
             provider=provider,
             model=model,
             working_directory=working_directory or os.path.expanduser("~"),
+            hooks={"on_post_tool_use": self._post_tool_use},
         )
         if config_directory is not None:
             os.makedirs(config_directory, exist_ok=True)
@@ -161,10 +185,25 @@ class CopilotHarness:
             )
             logger.info("Created Copilot session: %s", session_id)
 
+        workspace = self.session.workspace_path
+        if workspace is None:
+            raise RuntimeError(
+                "Copilot did not provide a workspace for todo checkpoints"
+            )
+        self._workspace = Path(workspace).resolve()
+        if config_directory is not None and not self._workspace.is_relative_to(
+            Path(config_directory).resolve()
+        ):
+            raise RuntimeError("Copilot workspace is outside the snapshot directory")
+        self._todo_fingerprint = await asyncio.to_thread(
+            todo_fingerprint, self._workspace
+        )
         self._unsubscribe = self.session.on(self._on_event)
 
     async def close(self) -> None:
         """Tear down the subscription and stop the CLI client."""
+        for pending in self._pending_checkpoints:
+            pending.cancel()
         if self._unsubscribe is not None:
             try:
                 self._unsubscribe()
@@ -179,6 +218,29 @@ class CopilotHarness:
             self._client = None
 
     # -- event pump ----------------------------------------------------------
+
+    async def _post_tool_use(
+        self, hook: PostToolUseHookInput, context: dict[str, str]
+    ) -> PostToolUseHookOutput | None:
+        if self._workspace is None:
+            raise RuntimeError(
+                "Todo checkpoint requested before workspace initialization"
+            )
+        async with self._checkpoint_lock:
+            fingerprint = await asyncio.to_thread(todo_fingerprint, self._workspace)
+            if fingerprint == self._todo_fingerprint:
+                return None
+            acknowledged = asyncio.get_running_loop().create_future()
+            self._pending_checkpoints.add(acknowledged)
+            # The task consumer persists with its request context and reports
+            # failures itself: the SDK logs and swallows hook exceptions.
+            self._queue.put_nowait(TodoCheckpointRequest(fingerprint, acknowledged))
+            try:
+                await acknowledged
+                self._todo_fingerprint = fingerprint
+            finally:
+                self._pending_checkpoints.discard(acknowledged)
+        return None
 
     def _on_event(self, event: Any) -> None:
         """SDK event callback → push onto the queue (idle terminates a turn)."""

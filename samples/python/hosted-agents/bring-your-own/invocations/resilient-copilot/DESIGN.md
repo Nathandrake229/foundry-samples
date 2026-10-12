@@ -84,6 +84,10 @@ Live snapshots use SQLite's online backup API, rather than copying active DB
 and WAL files. Database sidecars and process lock files are excluded from live
 archives, and incomplete JSONL tails are omitted.
 
+Only the per-session Copilot configuration/workspace tree is archived.
+Arbitrary files in `/tmp` or other working directories require their own
+durable storage; restoring the Copilot plan does not restore those files.
+
 Each SQLite database is consistent independently. The archive is not a single
 transaction across all files, and it cannot make outside tool effects exactly
 once.

@@ -197,6 +197,11 @@ an atomic snapshot across all files or an exactly-once guarantee for tool effect
 Recovery re-drives the prompt with the saved plan, rather than resuming a live
 instruction pointer.
 
+The archive covers the per-session Copilot configuration/workspace directory,
+not the entire container filesystem. Files under `/tmp` or another working
+directory do not survive replacement through this snapshot. Keep recoverable
+artifacts inside the snapshotted workspace or use separate durable storage.
+
 The latest snapshot is also saved after the client closes. In hosted execution
 it is a State Store item; offline execution uses a local archive. The default
 snapshot retention is 30 days from its latest write, separate from task

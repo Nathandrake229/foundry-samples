@@ -62,6 +62,7 @@ try:
     from .agent import (
         copilot_agent,
         fail_harness_start,
+        get_invocation_status,
         mark_client_cancel,
         reserve_harness,
         submit_elicitation_decision,
@@ -73,6 +74,7 @@ except ImportError:  # allow `python main.py` from inside this directory
     from agent import (
         copilot_agent,
         fail_harness_start,
+        get_invocation_status,
         mark_client_cancel,
         reserve_harness,
         submit_elicitation_decision,
@@ -288,44 +290,16 @@ async def handle_get(request: Request) -> Response:
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    # JSON snapshot (polling clients).
-    session_id = _session_id(request)
-    if not session_id:
-        return JSONResponse(
-            {"error": "Provide ?agent_session_id=<id> to locate the task."},
-            status_code=404,
-        )
-    try:
-        session_id = validate_session_id(session_id)
-    except ValueError as exc:
-        return _invalid_session_response(exc)
-    from azure.ai.agentserver.core.tasks._manager import (
-        get_task_manager,
-    )  # noqa: PLC0415
-
-    mgr = get_task_manager()
-    info: Any = await mgr.provider.get(_task_id(session_id))
-    if info is None:
+    status = await get_invocation_status(invocation_id)
+    if status is None:
         return JSONResponse({"error": "Task not found"}, status_code=404)
-
-    # NOTE: the session-marker FoundryStateStore is turn-scoped and cannot be
-    # read from this poll route while a turn is active on hosted (the storage
-    # API rejects it with a call_id mismatch -> 500), so the snapshot is derived
-    # from the task record only — mirroring the SDK reference GET handler.
-    _STATUS_MAP = {
-        "in_progress": "running",
-        "suspended": "completed",
-        "completed": "completed",
-        "failed": "failed",
-        "cancelled": "cancelled",
-    }
     return JSONResponse(
         {
-            "task_id": _task_id(session_id),
-            "invocation_id": invocation_id,
-            "status": _STATUS_MAP.get(info.status, info.status),
-            "task_status": info.status,
-            "payload": info.payload,
+            "task_id": status.get("task_id"),
+            "invocation_id": status.get("invocation_id"),
+            "status": status.get("status"),
+            "task_status": status.get("task_status"),
+            "payload": status.get("payload"),
         }
     )
 
@@ -345,11 +319,38 @@ async def handle_cancel(request: Request) -> Response:
         session_id = validate_session_id(session_id)
     except ValueError as exc:
         return _invalid_session_response(exc)
-    from azure.ai.agentserver.core.tasks._manager import (
-        get_task_manager,
-    )  # noqa: PLC0415
-
-    run = await get_task_manager().get_active_run(_task_id(session_id))
+    invocation_id: str = request.state.invocation_id
+    invocation = await get_invocation_status(invocation_id)
+    if invocation is None or invocation.get("status") != "running":
+        return JSONResponse(
+            {
+                "status": "not_found",
+                "message": "No active task for this invocation.",
+            }
+        )
+    expected_task_id = _task_id(session_id)
+    if invocation.get("task_id") != expected_task_id:
+        return JSONResponse(
+            {
+                "status": "not_found",
+                "message": "Invocation does not belong to the supplied session.",
+            }
+        )
+    framework_input_id = invocation.get("framework_input_id")
+    if not isinstance(framework_input_id, str) or not framework_input_id:
+        return JSONResponse(
+            {
+                "status": "not_found",
+                "message": (
+                    "Invocation has no exact framework input identity and cannot "
+                    "be cancelled safely."
+                ),
+            }
+        )
+    run = await copilot_agent.get_active_run(
+        expected_task_id,
+        framework_input_id,
+    )
     if run is None:
         return JSONResponse(
             {

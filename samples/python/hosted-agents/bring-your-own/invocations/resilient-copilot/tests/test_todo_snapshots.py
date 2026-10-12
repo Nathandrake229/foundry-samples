@@ -17,7 +17,12 @@ from unittest.mock import AsyncMock, patch
 SRC = Path(__file__).resolve().parents[1] / "src" / "resilient-copilot"
 sys.path.insert(0, str(SRC))
 
-from copilot_session import CopilotHarness, TodoCheckpointRequest
+from copilot.session import CopilotSession
+from copilot_session import (
+    CopilotHarness,
+    TodoCheckpointDetectionFailure,
+    TodoCheckpointRequest,
+)
 from store import SessionSnapshotStore, SnapshotTooLargeError, todo_fingerprint
 
 
@@ -170,6 +175,29 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await hook
         self.assertEqual(harness._todo_fingerprint, original)
 
+    async def test_pinned_sdk_swallow_still_delivers_detection_failure_to_consumer(
+        self,
+    ):
+        harness = CopilotHarness()
+        harness._workspace = self.workspace
+        harness._todo_fingerprint = todo_fingerprint(self.workspace)
+        sdk_session = CopilotSession("test", SimpleNamespace())
+        sdk_session._hooks = {"on_post_tool_use": harness._post_tool_use}
+
+        detection_error = sqlite3.DatabaseError("locked todo database")
+        with patch(
+            "copilot_session.todo_fingerprint",
+            side_effect=detection_error,
+        ):
+            dispatch = asyncio.create_task(
+                sdk_session._handle_hooks_invoke("postToolUse", {})
+            )
+            failure = await asyncio.wait_for(harness._queue.get(), 2)
+            self.assertIsInstance(failure, TodoCheckpointDetectionFailure)
+            self.assertIs(failure.error, detection_error)
+            failure.acknowledged.set_exception(failure.error)
+            self.assertIsNone(await asyncio.wait_for(dispatch, 2))
+
     async def test_close_unblocks_pending_hook(self):
         harness = CopilotHarness()
         harness._workspace = self.workspace
@@ -219,9 +247,19 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"AGENTSERVER_STATE_ROOT": self.tmp.name}):
             self.agent = importlib.import_module("agent")
 
-    async def exercise_task(self, *, checkpoint_failure=False, final_failure=False):
+    async def exercise_task(
+        self,
+        *,
+        checkpoint_failure=False,
+        final_failure=False,
+        detection_failure: BaseException | None = None,
+    ):
         acknowledgement = asyncio.get_running_loop().create_future()
-        request = TodoCheckpointRequest("todo-hash", acknowledgement)
+        request = (
+            TodoCheckpointDetectionFailure(detection_failure, acknowledgement)
+            if detection_failure is not None
+            else TodoCheckpointRequest("todo-hash", acknowledgement)
+        )
 
         class Harness:
             has_backend = staticmethod(lambda: True)
@@ -257,8 +295,11 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         snapshot = SimpleNamespace(
             save=AsyncMock(), restore=AsyncMock(return_value=False)
         )
+        invocation_store = SimpleNamespace(put=AsyncMock())
         expected_exception = None
-        if checkpoint_failure:
+        if detection_failure is not None:
+            expected_exception = type(detection_failure)
+        elif checkpoint_failure:
             failure = (
                 checkpoint_failure
                 if isinstance(checkpoint_failure, BaseException)
@@ -271,6 +312,7 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
             expected_exception = OSError
         context = SimpleNamespace(
             input={"invocation_id": "test-inv", "prompt": "test", "session_id": "test"},
+            input_id="framework-input",
             entry_mode="fresh",
             recovery_count=0,
             cancel=asyncio.Event(),
@@ -278,6 +320,8 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(self.agent, "CopilotHarness", Harness), patch.object(
             self.agent, "_SNAPSHOT_STORE", snapshot
+        ), patch.object(
+            self.agent, "_INVOCATION_STORE", invocation_store
         ), patch.object(
             self.agent, "_CONFIG_ROOT", self.root / "task-config"
         ), patch.object(
@@ -320,6 +364,19 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         _, stream, state_store = await self.exercise_task(checkpoint_failure=failure)
         self.assertEqual(
             [frame["type"] for frame in stream.frames], ["turn_start", "turn_failed"]
+        )
+        for call in state_store.set_item.call_args_list:
+            self.assertNotIn("has_snapshot", call.args[1])
+
+    async def test_detection_failure_emits_turn_failed_and_fails_task(self):
+        failure = sqlite3.DatabaseError("locked todo database")
+        snapshot, stream, state_store = await self.exercise_task(
+            detection_failure=failure
+        )
+        snapshot.save.assert_not_awaited()
+        self.assertEqual(
+            [frame["type"] for frame in stream.frames],
+            ["turn_start", "turn_failed"],
         )
         for call in state_store.set_item.call_args_list:
             self.assertNotIn("has_snapshot", call.args[1])

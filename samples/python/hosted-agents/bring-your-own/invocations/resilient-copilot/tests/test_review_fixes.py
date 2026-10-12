@@ -458,6 +458,34 @@ class FakeStateStore:
             self.log.append(f"state:{','.join(statuses)}")
 
 
+class FakeInvocationStore:
+    def __init__(self):
+        self.records = {}
+
+    async def get(self, invocation_id):
+        value = self.records.get(invocation_id)
+        return copy.deepcopy(value)
+
+    async def put(
+        self,
+        invocation_id,
+        *,
+        task_id,
+        framework_input_id,
+        status,
+        task_status,
+        payload=None,
+    ):
+        self.records[invocation_id] = {
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+            "framework_input_id": framework_input_id,
+            "status": status,
+            "task_status": task_status,
+            "payload": payload,
+        }
+
+
 class QueueHarness:
     instances = []
     start_gate = None
@@ -561,6 +589,12 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         QueueHarness.start_gate = None
         QueueHarness.log = None
         ImmediateHarness.log = None
+        self.invocation_store = FakeInvocationStore()
+        invocation_patch = patch.object(
+            agent, "_INVOCATION_STORE", self.invocation_store
+        )
+        invocation_patch.start()
+        self.addCleanup(invocation_patch.stop)
 
     def context(
         self,
@@ -569,6 +603,8 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         cancel=False,
         shutdown=False,
         cancel_requested=False,
+        invocation_id="invocation",
+        framework_input_id="framework-input",
     ):
         cancel_event = asyncio.Event()
         shutdown_event = asyncio.Event()
@@ -578,11 +614,12 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             shutdown_event.set()
         return SimpleNamespace(
             input={
-                "invocation_id": "invocation",
+                "invocation_id": invocation_id,
                 "prompt": "initial",
                 "session_id": "session",
             },
             entry_mode=entry_mode,
+            input_id=framework_input_id,
             recovery_count=1 if entry_mode == "recovered" else 0,
             cancel=cancel_event,
             shutdown=shutdown_event,
@@ -600,6 +637,7 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         restore_side_effect=None,
         snapshot_side_effect=None,
         log=None,
+        invocation_store=None,
     ):
         context = context or self.context()
         stream = FakeStream()
@@ -610,9 +648,12 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         if restore_side_effect is not None:
             snapshot.restore.side_effect = restore_side_effect
+        invocation_store = invocation_store or FakeInvocationStore()
         with patch.object(agent, "_CONFIG_ROOT", self.root / "config"), patch.object(
             agent, "_SNAPSHOT_STORE", snapshot
-        ), patch.object(agent, "CopilotHarness", harness), patch.object(
+        ), patch.object(agent, "_INVOCATION_STORE", invocation_store), patch.object(
+            agent, "CopilotHarness", harness
+        ), patch.object(
             agent.streams, "get_or_create", AsyncMock(return_value=stream)
         ), patch.object(
             agent.FoundryStateStore,
@@ -640,8 +681,14 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_promised_snapshot_missing_fails_instead_of_starting_fresh(self):
         with self.assertRaisesRegex(FileNotFoundError, "says a Copilot snapshot"):
-            await self.run_task(state={"has_snapshot": True})
+            await self.run_task(
+                state={"has_snapshot": True},
+                invocation_store=self.invocation_store,
+            )
         QueueHarness.instances[-1].start.assert_not_awaited()
+        self.assertEqual(
+            self.invocation_store.records["invocation"]["status"], "failed"
+        )
 
     async def test_legacy_config_and_marker_migrate_before_fresh_fallback(self):
         config_root = self.root / "legacy-config-root"
@@ -774,12 +821,17 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             shutdown=shutdown,
         )
         result, stream, _, snapshot = await self.run_task(
-            context=context, harness=StopHarness
+            context=context,
+            harness=StopHarness,
+            invocation_store=self.invocation_store,
         )
         self.assertEqual(type(result).__name__, "_ExitForRecovery")
         stream.close.assert_not_awaited()
         self.assertNotIn("turn_failed", [frame["type"] for frame in stream.frames])
         snapshot.save.assert_awaited()
+        self.assertEqual(
+            self.invocation_store.records["invocation"]["status"], "running"
+        )
 
     async def test_explicit_cancel_is_not_resurrected(self):
         class StopHarness(QueueHarness):
@@ -791,10 +843,17 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
 
         context = self.context(cancel=True, shutdown=True)
         agent.mark_client_cancel("session")
-        _, stream, _, _ = await self.run_task(context=context, harness=StopHarness)
+        _, stream, _, _ = await self.run_task(
+            context=context,
+            harness=StopHarness,
+            invocation_store=self.invocation_store,
+        )
         context.exit_for_recovery.assert_not_awaited()
         self.assertIn("cancelled", [frame["type"] for frame in stream.frames])
         stream.close.assert_awaited_once()
+        self.assertEqual(
+            self.invocation_store.records["invocation"]["status"], "cancelled"
+        )
 
     async def test_native_input_waits_for_ready_and_is_durable_before_202(self):
         log = []
@@ -967,6 +1026,35 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             and "watch_stop" in repr(task.get_coro())
         ]
         self.assertEqual(pending, [])
+
+    async def test_sequential_turns_keep_independent_invocation_status(self):
+        statuses = FakeInvocationStore()
+        await self.run_task(
+            context=self.context(invocation_id="old-invocation"),
+            invocation_store=statuses,
+        )
+        self.assertEqual(statuses.records["old-invocation"]["status"], "completed")
+
+        QueueHarness.instances.clear()
+        new_turn = asyncio.create_task(
+            self.run_task(
+                context=self.context(invocation_id="new-invocation"),
+                harness=QueueHarness,
+                invocation_store=statuses,
+            )
+        )
+        while not QueueHarness.instances:
+            await asyncio.sleep(0)
+        harness = QueueHarness.instances[-1]
+        while not harness.start.await_count:
+            await asyncio.sleep(0)
+
+        self.assertEqual(statuses.records["old-invocation"]["status"], "completed")
+        self.assertEqual(statuses.records["new-invocation"]["status"], "running")
+        await harness.queue.put(None)
+        await asyncio.wait_for(new_turn, 2)
+        self.assertEqual(statuses.records["old-invocation"]["status"], "completed")
+        self.assertEqual(statuses.records["new-invocation"]["status"], "completed")
 
     async def test_second_question_during_first_snapshot_keeps_both_ids(self):
         state = {
@@ -1224,7 +1312,14 @@ class StartupEnvironmentTests(unittest.TestCase):
 
 class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def request(body, *, session_id, invocation_id="invocation"):
+    def request(
+        body=None,
+        *,
+        session_id="session",
+        invocation_id="invocation",
+        method="POST",
+        accept=None,
+    ):
         sent = False
 
         async def receive():
@@ -1241,10 +1336,10 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
         request = main.Request(
             {
                 "type": "http",
-                "method": "POST",
+                "method": method,
                 "path": "/invocations",
                 "query_string": b"",
-                "headers": [],
+                "headers": ([(b"accept", accept.encode("ascii"))] if accept else []),
             },
             receive,
         )
@@ -1279,6 +1374,179 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(json.loads(response.body)["action"], "start")
         start.assert_awaited_once()
+
+    async def test_polling_old_invocation_stays_terminal_during_new_turn(self):
+        statuses = {
+            "old": {
+                "task_id": "copilot-session",
+                "invocation_id": "old",
+                "status": "completed",
+                "task_status": "suspended",
+                "payload": None,
+            },
+            "new": {
+                "task_id": "copilot-session",
+                "invocation_id": "new",
+                "status": "running",
+                "task_status": "in_progress",
+                "payload": None,
+            },
+        }
+
+        async def get_status(invocation_id):
+            return copy.deepcopy(statuses.get(invocation_id))
+
+        with patch.object(main, "get_invocation_status", side_effect=get_status):
+            old_response = await main.handle_get(
+                self.request(
+                    method="GET",
+                    invocation_id="old",
+                )
+            )
+            new_response = await main.handle_get(
+                self.request(
+                    method="GET",
+                    invocation_id="new",
+                )
+            )
+            statuses["new"]["status"] = "completed"
+            statuses["new"]["task_status"] = "suspended"
+            old_after = await main.handle_get(
+                self.request(method="GET", invocation_id="old")
+            )
+            missing = await main.handle_get(
+                self.request(method="GET", invocation_id="unknown")
+            )
+
+        self.assertEqual(json.loads(old_response.body)["status"], "completed")
+        self.assertEqual(json.loads(new_response.body)["status"], "running")
+        self.assertEqual(json.loads(old_after.body)["status"], "completed")
+        self.assertEqual(json.loads(old_after.body)["invocation_id"], "old")
+        self.assertEqual(
+            set(json.loads(old_after.body)),
+            {"task_id", "invocation_id", "status", "task_status", "payload"},
+        )
+        self.assertEqual(missing.status_code, 404)
+
+    async def test_cancel_race_cannot_cancel_replacement_input(self):
+        invocation_a = {
+            "task_id": "copilot-session",
+            "framework_input_id": "framework-a",
+            "status": "running",
+        }
+        run_b = SimpleNamespace(cancel=AsyncMock())
+
+        async def exact_lookup(task_id, framework_input_id):
+            self.assertEqual(task_id, "copilot-session")
+            # A completed and B became active after the metadata read.
+            return run_b if framework_input_id == "framework-b" else None
+
+        with patch.object(
+            main, "get_invocation_status", AsyncMock(return_value=invocation_a)
+        ), patch.object(
+            main.copilot_agent,
+            "get_active_run",
+            AsyncMock(side_effect=exact_lookup),
+        ) as get_active:
+            response = await main.handle_cancel(
+                self.request(
+                    method="POST",
+                    invocation_id="invocation-a",
+                    session_id="session",
+                )
+            )
+
+        self.assertEqual(json.loads(response.body)["status"], "not_found")
+        get_active.assert_awaited_once_with("copilot-session", "framework-a")
+        run_b.cancel.assert_not_awaited()
+
+    async def test_cancel_rejects_mismatched_session_and_legacy_identity(self):
+        get_active = AsyncMock()
+        with patch.object(
+            main,
+            "get_invocation_status",
+            AsyncMock(
+                return_value={
+                    "task_id": "copilot-other",
+                    "framework_input_id": "framework-a",
+                    "status": "running",
+                }
+            ),
+        ), patch.object(main.copilot_agent, "get_active_run", get_active):
+            mismatched = await main.handle_cancel(
+                self.request(
+                    method="POST",
+                    invocation_id="invocation-a",
+                    session_id="session",
+                )
+            )
+        self.assertIn("does not belong", json.loads(mismatched.body)["message"])
+        get_active.assert_not_awaited()
+
+        with patch.object(
+            main,
+            "get_invocation_status",
+            AsyncMock(
+                return_value={
+                    "task_id": "copilot-session",
+                    "status": "running",
+                }
+            ),
+        ), patch.object(main.copilot_agent, "get_active_run", get_active):
+            legacy = await main.handle_cancel(
+                self.request(
+                    method="POST",
+                    invocation_id="legacy",
+                    session_id="session",
+                )
+            )
+        self.assertIn("no exact framework input", json.loads(legacy.body)["message"])
+        get_active.assert_not_awaited()
+
+    async def test_cancel_exact_framework_input_cancels_matching_run(self):
+        run = SimpleNamespace(cancel=AsyncMock())
+        with patch.object(
+            main,
+            "get_invocation_status",
+            AsyncMock(
+                return_value={
+                    "task_id": "copilot-session",
+                    "framework_input_id": "framework-b",
+                    "status": "running",
+                }
+            ),
+        ), patch.object(
+            main.copilot_agent,
+            "get_active_run",
+            AsyncMock(return_value=run),
+        ) as get_active:
+            response = await main.handle_cancel(
+                self.request(
+                    method="POST",
+                    invocation_id="invocation-b",
+                    session_id="session",
+                )
+            )
+        self.assertEqual(json.loads(response.body)["status"], "cancelled")
+        get_active.assert_awaited_once_with("copilot-session", "framework-b")
+        run.cancel.assert_awaited_once()
+
+    async def test_sse_done_frame_uses_requested_invocation_id(self):
+        class Stream:
+            async def subscribe(self, after=None):
+                if False:
+                    yield None
+
+        with patch.object(main.streams, "get", AsyncMock(return_value=Stream())):
+            response = await main.handle_get(
+                self.request(
+                    method="GET",
+                    invocation_id="old",
+                    accept="text/event-stream",
+                )
+            )
+            body = b"".join([chunk async for chunk in response.body_iterator])
+        self.assertIn(b'"invocation_id": "old"', body)
 
 
 if __name__ == "__main__":

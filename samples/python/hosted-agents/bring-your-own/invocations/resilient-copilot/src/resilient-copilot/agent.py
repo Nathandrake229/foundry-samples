@@ -27,9 +27,11 @@ try:
         ElicitationRequest,
         HarnessClosingError,
         NativeInputRequest,
+        TodoCheckpointDetectionFailure,
         TodoCheckpointRequest,
     )
     from .store import (
+        InvocationStatusStore,
         SessionSnapshotStore,
         session_storage_key,
         validate_session_id,
@@ -41,13 +43,20 @@ except ImportError:  # allow `python main.py` from inside this directory
         ElicitationRequest,
         HarnessClosingError,
         NativeInputRequest,
+        TodoCheckpointDetectionFailure,
         TodoCheckpointRequest,
     )
-    from store import SessionSnapshotStore, session_storage_key, validate_session_id
+    from store import (
+        InvocationStatusStore,
+        SessionSnapshotStore,
+        session_storage_key,
+        validate_session_id,
+    )
 
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = SessionSnapshotStore(resolve_state_subdir("copilot-snapshots"))
+_INVOCATION_STORE = InvocationStatusStore(resolve_state_subdir("copilot-invocations"))
 _CONFIG_ROOT = resolve_state_subdir("copilot-sessions")
 _SIMULATE_CRASH_AFTER_EVENTS = int(os.environ.get("SIMULATE_CRASH_AFTER_EVENTS", "-1"))
 _MAX_INPUT_JOURNAL_ENTRIES = 32
@@ -144,6 +153,11 @@ class _HarnessSlot:
 
 _HARNESS_SLOTS: dict[str, _HarnessSlot] = {}
 _CLIENT_CANCEL_REQUESTED: set[str] = set()
+
+
+async def get_invocation_status(invocation_id: str) -> dict[str, Any] | None:
+    """Return one invocation's durable polling record."""
+    return await _INVOCATION_STORE.get(invocation_id)
 
 
 def reserve_harness(session_id: str) -> _HarnessSlot:
@@ -261,6 +275,8 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
     inv_id: str = ctx.input["invocation_id"]
     prompt: str = ctx.input["prompt"]
     recovered = ctx.entry_mode == "recovered"
+    task_id = f"copilot-{session_id}"
+    framework_input_id = str(ctx.input_id)
     config_dir = _config_dir_for(session_id)
     slot = reserve_harness(session_id)
     harness = CopilotHarness()
@@ -291,6 +307,13 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
         _sync_pending_elicitation(state)
         if legacy_state_migrated:
             await state_store.set_item("state", state)
+        await _INVOCATION_STORE.put(
+            inv_id,
+            task_id=task_id,
+            framework_input_id=framework_input_id,
+            status="running",
+            task_status="in_progress",
+        )
 
         stream = await streams.get_or_create(inv_id)
         seq = await stream.last_cursor() or 0
@@ -590,6 +613,10 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     if not event.acknowledged.done():
                         event.acknowledged.set_result(None)
                 continue
+            if isinstance(event, TodoCheckpointDetectionFailure):
+                if not event.acknowledged.done():
+                    event.acknowledged.set_exception(event.error)
+                raise event.error
             if isinstance(event, ElicitationRequest):
                 await process_elicitation_request(event)
                 continue
@@ -622,6 +649,13 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
             state["elicitations"] = {}
             state["pending_elicitation"] = None
             await persist_state()
+            await _INVOCATION_STORE.put(
+                inv_id,
+                task_id=task_id,
+                framework_input_id=framework_input_id,
+                status="cancelled",
+                task_status="cancelled",
+            )
             await emit({"type": "cancelled"})
             await stream.close()
             return
@@ -635,10 +669,27 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
         ]
         _confirm_submitted_elicitations(state)
         await persist_state()
+        await _INVOCATION_STORE.put(
+            inv_id,
+            task_id=task_id,
+            framework_input_id=framework_input_id,
+            status="completed",
+            task_status="suspended",
+        )
         await emit({"type": "turn_complete"})
         await stream.close()
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("copilot_agent turn failed; emitting terminal frame")
+        try:
+            await _INVOCATION_STORE.put(
+                inv_id,
+                task_id=task_id,
+                framework_input_id=framework_input_id,
+                status="failed",
+                task_status="failed",
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("failed to persist invocation failure status")
         if not slot.ready.done():
             slot.ready.set_exception(exc)
             slot.ready.exception()

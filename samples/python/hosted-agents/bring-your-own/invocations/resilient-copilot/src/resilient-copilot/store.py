@@ -62,6 +62,8 @@ _STATE_VALUE_JSON_OVERHEAD = len(
 _MAX_BASE64_CHARS = ((_MAX_STATE_VALUE_BYTES - _STATE_VALUE_JSON_OVERHEAD) // 4) * 4
 _MAX_ARCHIVE_BYTES = (_MAX_BASE64_CHARS // 4) * 3
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+_INVOCATION_STORE_NAME = "copilot-invocations"
+_INVOCATION_TTL_SECONDS = 30 * 24 * 60 * 60
 
 
 class SnapshotTooLargeError(ValueError):
@@ -428,3 +430,81 @@ class SessionSnapshotStore:
                 await store.aclose()
         self._store = None
         self._legacy_store = None
+
+
+class InvocationStatusStore:
+    """Durable invocation-id -> polling status store."""
+
+    def __init__(self, base_dir: Path) -> None:
+        self._base = base_dir
+        self._base.mkdir(parents=True, exist_ok=True)
+        self._use_state_store = bool(os.environ.get("FOUNDRY_PROJECT_ENDPOINT"))
+        self._store: Any = None
+
+    async def _state_store(self) -> Any:
+        if self._store is None:
+            from azure.ai.agentserver.core.storage import (  # noqa: PLC0415
+                FoundryStateStore,
+            )
+
+            self._store = await FoundryStateStore.get_or_create(
+                _INVOCATION_STORE_NAME,
+                item_ttl_seconds=_INVOCATION_TTL_SECONDS,
+            )
+        return self._store
+
+    async def get(self, invocation_id: str) -> dict[str, Any] | None:
+        if self._use_state_store:
+            item = await (await self._state_store()).get_item(invocation_id)
+            return (
+                dict(item.value)
+                if item is not None and isinstance(item.value, dict)
+                else None
+            )
+        path = self._path(invocation_id)
+        if not path.exists():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return dict(value) if isinstance(value, dict) else None
+
+    async def put(
+        self,
+        invocation_id: str,
+        *,
+        task_id: str,
+        framework_input_id: str,
+        status: str,
+        task_status: str,
+        payload: Any = None,
+    ) -> None:
+        value = {
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+            "framework_input_id": framework_input_id,
+            "status": status,
+            "task_status": task_status,
+            "payload": payload,
+        }
+        if self._use_state_store:
+            await (await self._state_store()).set_item(invocation_id, value)
+            return
+        await self._write_local(invocation_id, value)
+
+    async def _write_local(self, invocation_id: str, value: dict[str, Any]) -> None:
+        target = self._path(invocation_id)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(self._base),
+            prefix=f"{hashlib.sha256(invocation_id.encode()).hexdigest()}_",
+            suffix=".tmp",
+        )
+        try:
+            with open(fd, "w", encoding="utf-8") as handle:
+                json.dump(value, handle)
+            Path(tmp).replace(target)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+    def _path(self, invocation_id: str) -> Path:
+        key = hashlib.sha256(invocation_id.encode("utf-8")).hexdigest()
+        return self._base / f"{key}.json"

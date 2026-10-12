@@ -101,6 +101,12 @@ class TodoCheckpointRequest:
     acknowledged: asyncio.Future[None]
 
 
+@dataclass
+class TodoCheckpointDetectionFailure:
+    error: BaseException
+    acknowledged: asyncio.Future[None]
+
+
 class CopilotHarness:
     """Owns one Copilot CLI client + session and bridges it to the task."""
 
@@ -276,7 +282,21 @@ class CopilotHarness:
                 "Todo checkpoint requested before workspace initialization"
             )
         async with self._checkpoint_lock:
-            fingerprint = await asyncio.to_thread(todo_fingerprint, self._workspace)
+            try:
+                fingerprint = await asyncio.to_thread(todo_fingerprint, self._workspace)
+            except Exception as exc:
+                acknowledged = asyncio.get_running_loop().create_future()
+                self._pending_checkpoints.add(acknowledged)
+                self._queue.put_nowait(
+                    TodoCheckpointDetectionFailure(exc, acknowledged)
+                )
+                try:
+                    await acknowledged
+                finally:
+                    self._pending_checkpoints.discard(acknowledged)
+                raise AssertionError(
+                    "Todo checkpoint detection failure was not propagated"
+                ) from exc
             if fingerprint == self._todo_fingerprint:
                 return None
             acknowledged = asyncio.get_running_loop().create_future()

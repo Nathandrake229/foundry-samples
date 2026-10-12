@@ -69,9 +69,9 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 |---|---|
 | `POST /invocations` `{"input": "...", "mode": "immediate"\|"enqueue"?}` | Start (or resume) a turn; if a turn is already live, **steer** (`immediate`) or **queue** (`enqueue`) it. Returns `202` JSON, or a live SSE stream when `Accept: text/event-stream`. |
 | `GET /invocations/{id}` (`Accept: text/event-stream`, optional `?last_event_id=N`) | Reconnectable SSE; the file-backed replay serves the gap after a drop/crash before live-tailing. |
-| `GET /invocations/{id}` (no SSE header) | JSON snapshot of the task status / metadata. |
+| `GET /invocations/{id}` (no SSE header) | Invocation-scoped JSON status/result; earlier IDs do not report a later turn's state. |
 | `POST /elicit` `{"session_id","elicitation_id","action","content"?}` | Answer a human-in-the-loop pause (`action`: `accept`\|`decline`\|`cancel`). |
-| `POST /invocations/{id}/cancel` | Abort the in-flight Copilot turn and wind the task down. |
+| `POST /invocations/{id}/cancel` | Abort the specified active invocation, not a later turn in the same session. |
 
 ## Environment Variables
 
@@ -180,8 +180,9 @@ The pinned CLI stores todos in the session workspace's `session.db`. The
 post-tool hook compares the `todos` and `todo_deps` rows and `plan.md` with the
 last acknowledged state. Read-only queries do not create another snapshot.
 The task handles the checkpoint in its own request context and acknowledges the
-hook only after saving the snapshot and marker. Checkpoint failures fail the
-turn rather than claiming progress was saved.
+hook only after saving the snapshot and marker. Detection and persistence
+failures reach the task consumer and fail the turn rather than claiming
+progress was saved; SDK hook-error suppression is not treated as success.
 
 Live snapshots use SQLite's online backup API, so committed todo rows in an
 active WAL are included without copying active database sidecars. An incomplete

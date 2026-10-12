@@ -53,7 +53,8 @@ There are three distinct persistence boundaries:
 2. **Application state and session snapshot.** The sample saves its control
    state in `FoundryStateStore`. A session snapshot contains the Copilot
    configuration directory, including conversation databases, todo state,
-   `plan.md` and session artifacts.
+   `plan.md` and session artifacts. Separate invocation-keyed records preserve
+   each turn's polling status across later turns in the same session.
 3. **Replay stream.** Copilot events are written to a file-backed stream with
    increasing sequence numbers. This is separate from the State Store snapshot;
    saving an event is not proof that the session snapshot was committed.
@@ -76,7 +77,8 @@ hook requests a snapshot and waits for persistence acknowledgement.
 The task consumer performs the write in its execution context, then emits
 `todo_checkpoint`. This is important because the Copilot SDK logs hook errors
 without necessarily stopping the model. The task must fail explicitly when
-its checkpoint cannot be saved.
+checkpoint detection or persistence fails; detection errors must reach the
+consumer even when the SDK suppresses the hook exception.
 
 Live snapshots use SQLite's online backup API, rather than copying active DB
 and WAL files. Database sidecars and process lock files are excluded from live
@@ -109,6 +111,14 @@ snapshot.
 A first invocation starts the resilient task. Follow-ups must wait for a ready
 Copilot harness or be routed to a durable next-turn path when the previous
 harness is closing.
+
+Invocation status is keyed by invocation ID, separately from the reusable
+session task. Polling an earlier invocation must not expose a later turn's
+active status or payload merely because both turns share that task. Cancelling
+a completed invocation must not cancel a newer invocation sharing its session.
+Cancellation must also bind to the invocation's stored framework input identity
+and task identity; checking status before a session-only lookup is insufficient
+because a later turn can start between those operations.
 
 Native `send(mode="immediate")` redirects an active Copilot turn.
 `send(mode="enqueue")` submits a follow-up after the current work. These are

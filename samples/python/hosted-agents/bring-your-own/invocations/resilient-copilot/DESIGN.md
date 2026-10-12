@@ -201,6 +201,10 @@ tokens through Azure credentials. Long turns need token acquisition on demand,
 rather than one bearer token fixed for the whole session. The GitHub backend
 uses the configured GitHub token.
 
+An optional model endpoint override must not replace the hosting project's
+State Store binding. Cross-resource models require inference authorization for
+the hosted identity.
+
 Credentials are not snapshot contents. New token acquisition remains subject
 to current identity configuration and permissions. This demonstration
 auto-approves tool permissions and should only receive trusted requests.

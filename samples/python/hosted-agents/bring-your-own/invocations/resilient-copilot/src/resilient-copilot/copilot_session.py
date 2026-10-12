@@ -136,7 +136,9 @@ class CopilotHarness:
         The Copilot runtime invokes ``bearer_token_provider`` for every model
         request. Azure Identity owns token caching and refresh.
         """
-        endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
+        endpoint = os.environ.get("AZURE_AI_MODEL_ENDPOINT") or os.environ.get(
+            "FOUNDRY_PROJECT_ENDPOINT", ""
+        )
         model = os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME", "")
         if not endpoint or not model:
             return None, None
@@ -161,7 +163,10 @@ class CopilotHarness:
     def has_backend() -> bool:
         """True if either a BYOK Foundry model or a GITHUB_TOKEN is configured."""
         byok = bool(
-            os.environ.get("FOUNDRY_PROJECT_ENDPOINT")
+            (
+                os.environ.get("AZURE_AI_MODEL_ENDPOINT")
+                or os.environ.get("FOUNDRY_PROJECT_ENDPOINT")
+            )
             and os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME")
         )
         return byok or bool(os.environ.get("GITHUB_TOKEN"))
@@ -195,8 +200,9 @@ class CopilotHarness:
             self._client = CopilotClient(github_token=github_token)
         else:
             raise RuntimeError(
-                "Set GITHUB_TOKEN (Copilot model) or FOUNDRY_PROJECT_ENDPOINT + "
-                "AZURE_AI_MODEL_DEPLOYMENT_NAME (BYOK Foundry model)."
+                "Set GITHUB_TOKEN (Copilot model) or AZURE_AI_MODEL_DEPLOYMENT_NAME "
+                "with AZURE_AI_MODEL_ENDPOINT or FOUNDRY_PROJECT_ENDPOINT "
+                "(BYOK Foundry model)."
             )
         try:
             await self._client.start()

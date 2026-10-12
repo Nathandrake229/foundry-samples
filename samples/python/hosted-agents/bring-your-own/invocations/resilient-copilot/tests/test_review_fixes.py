@@ -262,14 +262,52 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
             },
             clear=True,
         ), patch("azure.identity.aio.DefaultAzureCredential", return_value=credential):
+            self.assertTrue(harness.has_backend())
             provider, model = harness._byok_provider()
         self.assertEqual(model, "model")
+        self.assertEqual(provider["base_url"], "https://example.test")
         callback = provider["bearer_token_provider"]
         self.assertEqual(await callback({}), "first")
         self.assertEqual(await callback({}), "second")
         self.assertEqual(credential.get_token.await_count, 2)
         await harness.close()
         credential.close.assert_awaited_once()
+
+    async def test_model_endpoint_override_preserves_storage_project(self):
+        for project in ("https://storage.example.test", ""):
+            with self.subTest(project=project):
+                credential = SimpleNamespace(close=AsyncMock())
+                harness = CopilotHarness()
+                with patch.dict(
+                    os.environ,
+                    {
+                        "FOUNDRY_PROJECT_ENDPOINT": project,
+                        "AZURE_AI_MODEL_ENDPOINT": "https://model.example.test",
+                        "AZURE_AI_MODEL_DEPLOYMENT_NAME": "model",
+                    },
+                    clear=True,
+                ), patch(
+                    "azure.identity.aio.DefaultAzureCredential", return_value=credential
+                ):
+                    self.assertTrue(harness.has_backend())
+                    provider, model = harness._byok_provider()
+                    self.assertEqual(os.environ["FOUNDRY_PROJECT_ENDPOINT"], project)
+                self.assertEqual(provider["base_url"], "https://model.example.test")
+                self.assertEqual(provider["wire_api"], "responses")
+                self.assertEqual(model, "model")
+                await harness.close()
+                credential.close.assert_awaited_once()
+
+    def test_model_endpoint_without_deployment_does_not_enable_backend(self):
+        harness = CopilotHarness()
+        with patch.dict(
+            os.environ,
+            {"AZURE_AI_MODEL_ENDPOINT": "https://model.example.test"},
+            clear=True,
+        ), patch("azure.identity.aio.DefaultAzureCredential") as credential:
+            self.assertFalse(harness.has_backend())
+            self.assertEqual(harness._byok_provider(), (None, None))
+            credential.assert_not_called()
 
     async def test_resume_failure_never_creates_fresh_session(self):
         harness = CopilotHarness()

@@ -75,17 +75,21 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 
 ## Environment Variables
 
-This agent supports two LLM backends (same selection logic as the
-[github-copilot](../github-copilot) getting-started sample):
+This agent supports two LLM backends:
 
 | Variable | Required | Description |
 |---|---|---|
-| `FOUNDRY_PROJECT_ENDPOINT` | For Foundry model | Azure AI Foundry project endpoint. Auto-injected when hosted; set locally for local runs. |
+| `FOUNDRY_PROJECT_ENDPOINT` | For Foundry hosting | Foundry project endpoint. Auto-injected when hosted; set locally for local runs. Also the default model endpoint. |
+| `AZURE_AI_MODEL_ENDPOINT` | No | Optional model endpoint override when the model is in another Foundry project. Does not change the State Store/hosting project; the identity needs inference access to that model resource. |
 | `AZURE_AI_MODEL_DEPLOYMENT_NAME` | For Foundry model | Model deployment name (e.g. `gpt-5.4-mini`). |
 | `GITHUB_TOKEN` | For Copilot model | GitHub fine-grained PAT with **Copilot Requests → Read-only**. |
 | `SIMULATE_CRASH_AFTER_EVENTS` | No | Local crash-recovery testing hook (see below). |
 
 - Foundry model set → **BYOK via Managed Identity** (no token). Copilot model set → uses `GITHUB_TOKEN`. Both set → **Foundry wins**.
+
+The model deployment must support the Responses API. Model hosting can be in a
+different region/project from the hosted agent; use the endpoint override rather
+than replacing the platform-provided `FOUNDRY_PROJECT_ENDPOINT`.
 
 ## Run it locally
 

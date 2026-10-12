@@ -76,6 +76,54 @@ class SnapshotSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 validate_session_id(invalid)
 
+    def test_pack_skips_links_before_database_or_jsonl_reads(self):
+        source = self.root / "source"
+        source.mkdir()
+        (source / "keep.txt").write_text("keep", encoding="utf-8")
+        link_names = {"linked.db", "linked.jsonl", "linked.txt"}
+        for name in link_names:
+            (source / name).write_text("outside fixture\n", encoding="utf-8")
+        with patch.object(
+            Path,
+            "is_symlink",
+            autospec=True,
+            side_effect=lambda item: item.name in link_names,
+        ), patch.object(snapshot_module, "_sqlite_backup") as backup, patch.object(
+            snapshot_module, "_complete_jsonl_prefix_size"
+        ) as prefix:
+            blob = _pack_dir(source, live=True)
+        backup.assert_not_called()
+        prefix.assert_not_called()
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
+            self.assertEqual(archive.getnames(), ["keep.txt"])
+
+    def test_pack_and_restore_exclude_real_outside_and_broken_symlinks(self):
+        source = self.root / "source"
+        source.mkdir()
+        outside = self.root / "outside.txt"
+        outside.write_text("outside fixture\n", encoding="utf-8")
+        (source / "keep.txt").write_text("keep", encoding="utf-8")
+        try:
+            for name in ("linked.db", "linked.jsonl", "linked.txt"):
+                (source / name).symlink_to(outside)
+            (source / "broken.db").symlink_to(self.root / "missing")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege is unavailable")
+            raise
+        for live in (False, True):
+            with self.subTest(live=live):
+                blob = _pack_dir(source, live=live)
+                with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as archive:
+                    self.assertEqual(archive.getnames(), ["keep.txt"])
+                destination = self.root / f"restored-{live}"
+                _unpack_dir(blob, destination)
+                self.assertEqual((destination / "keep.txt").read_text(), "keep")
+                self.assertEqual(
+                    list(destination.iterdir()), [destination / "keep.txt"]
+                )
+        self.assertEqual(outside.read_text(), "outside fixture\n")
+
     def test_archive_rejects_traversal_before_replacing_destination(self):
         destination = self.root / "destination"
         destination.mkdir()

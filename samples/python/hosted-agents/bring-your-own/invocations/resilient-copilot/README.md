@@ -192,7 +192,9 @@ progress was saved; SDK hook-error suppression is not treated as success.
 
 Live snapshots use SQLite's online backup API, so committed todo rows in an
 active WAL are included without copying active database sidecars. An incomplete
-JSONL tail is omitted. Each database is consistent independently; this is not
+JSONL tail is omitted. Symbolic links are excluded before any file is read,
+so they cannot add out-of-tree data or unrestorable link members.
+Each database is consistent independently; this is not
 an atomic snapshot across all files or an exactly-once guarantee for tool effects.
 Recovery re-drives the prompt with the saved plan, rather than resuming a live
 instruction pointer.

@@ -216,7 +216,7 @@ def _pack_dir(
         stage = Path(staging)
         with tarfile.open(fileobj=output, mode="w|") as tar:
             for item in sorted(src.rglob("*")):
-                if not item.is_file() or _is_lockfile(item.name):
+                if item.is_symlink() or not item.is_file() or _is_lockfile(item.name):
                     continue
                 relative = item.relative_to(src)
                 if live and item.name.endswith(("-wal", "-shm", "-journal")):

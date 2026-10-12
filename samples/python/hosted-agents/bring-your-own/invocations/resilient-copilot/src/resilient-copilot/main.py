@@ -104,15 +104,17 @@ def _task_id(session_id: str) -> str:
 
 _INPUT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _ELICITATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_MISSING = object()
 
 
-def _validate_input_id(value: Any) -> str:
-    input_id = str(value or uuid.uuid4())
-    if not _INPUT_ID_RE.fullmatch(input_id):
+def _validate_input_id(value: Any = _MISSING) -> str:
+    if value is _MISSING:
+        return str(uuid.uuid4())
+    if not isinstance(value, str) or not _INPUT_ID_RE.fullmatch(value):
         raise ValueError(
             "input_id must be 1-128 ASCII letters, digits, underscores, or hyphens"
         )
-    return input_id
+    return value
 
 
 def _invalid_session_response(exc: ValueError) -> JSONResponse:
@@ -122,12 +124,11 @@ def _invalid_session_response(exc: ValueError) -> JSONResponse:
 
 
 def _validate_elicitation_id(value: Any) -> str:
-    elicitation_id = str(value)
-    if not _ELICITATION_ID_RE.fullmatch(elicitation_id):
+    if not isinstance(value, str) or not _ELICITATION_ID_RE.fullmatch(value):
         raise ValueError(
             "elicitation_id must be 1-128 ASCII letters, digits, underscores, or hyphens"
         )
-    return elicitation_id
+    return value
 
 
 def _session_id(request: Request) -> str:
@@ -199,7 +200,9 @@ async def handle_invoke(request: Request) -> Response:
     invocation_id: str = request.state.invocation_id
     try:
         session_id = validate_session_id(str(request.state.session_id))
-        input_id = _validate_input_id(data.get("input_id"))
+        input_id = _validate_input_id(
+            data["input_id"] if "input_id" in data else _MISSING
+        )
         task_id = _task_id(session_id)
     except ValueError as exc:
         return _invalid_session_response(exc)

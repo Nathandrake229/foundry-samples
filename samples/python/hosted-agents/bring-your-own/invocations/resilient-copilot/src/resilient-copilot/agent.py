@@ -371,17 +371,17 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     ),
                     None,
                 )
+                if record is not None and (
+                    record.get("prompt") != request.prompt
+                    or record.get("mode") != request.mode
+                ):
+                    error = ValueError(
+                        "input_id is already bound to a different prompt or mode"
+                    )
+                    if not request.acknowledged.done():
+                        request.acknowledged.set_exception(error)
+                    return
                 if record is not None and record.get("status") == "delivered":
-                    if (
-                        record.get("prompt") != request.prompt
-                        or record.get("mode") != request.mode
-                    ):
-                        error = ValueError(
-                            "input_id is already bound to a different prompt or mode"
-                        )
-                        if not request.acknowledged.done():
-                            request.acknowledged.set_exception(error)
-                        return
                     result = {
                         "status": "delivered",
                         "input_id": request.input_id,
@@ -549,7 +549,23 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     }
                 )
 
-        await harness.send(prompt, causal_idle=True)
+        incoming_input_id = ctx.input.get("input_id")
+        incoming_mode = ctx.input.get("mode") or "enqueue"
+        incoming_record = next(
+            (
+                record
+                for record in _input_journal(state)
+                if record.get("input_id") == incoming_input_id
+            ),
+            None,
+        )
+        if incoming_record is not None and (
+            incoming_record.get("prompt") != prompt
+            or incoming_record.get("mode") != incoming_mode
+        ):
+            raise ValueError("input_id is already bound to a different prompt or mode")
+        if incoming_record is None:
+            await harness.send(prompt, causal_idle=True)
 
         # Re-drive controls that were durably accepted but not covered by a
         # completed Copilot idle boundary. A crash after send and before the

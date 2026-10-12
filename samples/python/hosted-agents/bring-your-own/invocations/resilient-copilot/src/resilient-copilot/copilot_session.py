@@ -113,6 +113,10 @@ class CopilotHarness:
     def __init__(self) -> None:
         self._client: CopilotClient | None = None
         self.session: Any = None
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._deferred_events: deque[Any] = deque()
         self._unsubscribe: Callable[[], None] | None = None
@@ -192,6 +196,7 @@ class CopilotHarness:
             is persisted. Point this at a per-session, durable-store-backed path
             so ``resume_session`` can rehydrate after a container restart.
         """
+        self._loop = asyncio.get_running_loop()
         provider, model = self._byok_provider()
         github_token = os.environ.get("GITHUB_TOKEN")
         if provider:
@@ -277,6 +282,7 @@ class CopilotHarness:
         self._credential = None
         if credential is not None:
             await credential.close()
+        self._loop = None
 
     # -- event pump ----------------------------------------------------------
 
@@ -318,7 +324,23 @@ class CopilotHarness:
         return None
 
     def _on_event(self, event: Any) -> None:
-        """SDK event callback → push onto the queue (idle terminates a turn)."""
+        """Marshal an SDK reader-thread callback onto the harness event loop."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.debug("dropping Copilot event after harness shutdown")
+            return
+        try:
+            if asyncio.get_running_loop() is loop:
+                self._enqueue_event(event)
+                return
+        except RuntimeError:
+            pass
+        loop.call_soon_threadsafe(self._enqueue_event, event)
+
+    def _enqueue_event(self, event: Any) -> None:
+        """Push one session event onto the loop-owned queue."""
+        if self._loop is None:
+            return
         event_type = getattr(event, "type", None)
         if event_type == SessionEventType.SESSION_IDLE:
             self._queue.put_nowait(IdleBoundary(event))
@@ -398,9 +420,12 @@ class CopilotHarness:
                 on_response_inline=mark_response_boundary,
             )
         )
+        receive_task: asyncio.Task[Any] | None = None
+        receive_consumed = True
         try:
             while True:
                 receive_task = asyncio.create_task(self._next_event())
+                receive_consumed = False
                 done, _ = await asyncio.wait(
                     {send_task, receive_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -412,6 +437,7 @@ class CopilotHarness:
 
                 if receive_task in done:
                     item = receive_task.result()
+                    receive_consumed = True
                     if isinstance(item, ResponseBoundary) and item.token is token:
                         response = await send_task
                         return response["messageId"]
@@ -420,7 +446,16 @@ class CopilotHarness:
                 else:
                     receive_task.cancel()
                     await asyncio.gather(receive_task, return_exceptions=True)
+                    receive_consumed = True
         finally:
+            if receive_task is not None and not receive_consumed:
+                if not receive_task.done():
+                    receive_task.cancel()
+                    await asyncio.gather(receive_task, return_exceptions=True)
+                elif not receive_task.cancelled():
+                    item = receive_task.result()
+                    if not (isinstance(item, ResponseBoundary) and item.token is token):
+                        buffered.append(item)
             if not send_task.done():
                 send_task.cancel()
                 await asyncio.gather(send_task, return_exceptions=True)

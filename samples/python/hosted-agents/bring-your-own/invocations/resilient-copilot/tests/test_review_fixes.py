@@ -13,6 +13,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import AsyncMock, patch
 
 
@@ -37,6 +38,7 @@ from copilot_session import (
     TodoCheckpointRequest,
 )
 import store as snapshot_module
+import copilot_session as copilot_session_module
 from store import (
     SessionSnapshotStore,
     SnapshotTooLargeError,
@@ -414,6 +416,99 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
             current_idle,
         )
 
+    async def test_cancelled_send_barrier_cleans_receiver_without_event_loss(self):
+        release = asyncio.Event()
+
+        class Client:
+            async def request(self, method, params, *, on_response_inline):
+                await release.wait()
+                return {"messageId": "never"}
+
+        harness = CopilotHarness()
+        harness.session = SimpleNamespace(_client=Client(), session_id="session")
+        sending = asyncio.create_task(
+            harness.send("follow up", mode="enqueue", causal_idle=True)
+        )
+        await asyncio.sleep(0)
+        sending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await sending
+
+        event = SimpleNamespace(type=SessionEventType.ASSISTANT_INTENT)
+        harness._on_event(event)
+        self.assertIs(await asyncio.wait_for(anext(harness.events()), 2), event)
+        self.assertFalse(
+            any(
+                "_next_event" in repr(task.get_coro())
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and not task.done()
+            )
+        )
+
+    async def test_cancelled_send_barrier_preserves_concurrently_dequeued_event(self):
+        release = asyncio.Event()
+
+        class Client:
+            async def request(self, method, params, *, on_response_inline):
+                await release.wait()
+                return {"messageId": "never"}
+
+        harness = CopilotHarness()
+        harness.session = SimpleNamespace(_client=Client(), session_id="session")
+        event = SimpleNamespace(type=SessionEventType.ASSISTANT_INTENT)
+        harness._enqueue_event(event)
+        original_wait = copilot_session_module.asyncio.wait
+
+        async def cancel_after_receiver_finishes(tasks, **kwargs):
+            receive = next(
+                task for task in tasks if "_next_event" in repr(task.get_coro())
+            )
+            await original_wait({receive}, return_when=asyncio.ALL_COMPLETED)
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+        with patch.object(
+            copilot_session_module.asyncio,
+            "wait",
+            side_effect=cancel_after_receiver_finishes,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await harness.send("follow up", mode="enqueue", causal_idle=True)
+
+        self.assertIs(await asyncio.wait_for(anext(harness.events()), 2), event)
+
+    async def test_sdk_reader_thread_events_wake_loop_in_debug_mode(self):
+        harness = CopilotHarness()
+        loop = asyncio.get_running_loop()
+        old_debug = loop.get_debug()
+        errors = []
+        old_handler = loop.get_exception_handler()
+        loop.set_debug(True)
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+        events = [
+            SimpleNamespace(type=SessionEventType.ASSISTANT_INTENT, value=index)
+            for index in range(3)
+        ]
+        idle = SimpleNamespace(type=SessionEventType.SESSION_IDLE, value=3)
+        try:
+            thread = threading.Thread(
+                target=lambda: [harness._on_event(event) for event in [*events, idle]]
+            )
+            thread.start()
+            await asyncio.to_thread(thread.join)
+            received = [event async for event in harness.events()]
+            self.assertEqual(received, [*events, idle])
+            await harness.close()
+            after_close = threading.Thread(target=lambda: harness._on_event(events[0]))
+            after_close.start()
+            await asyncio.to_thread(after_close.join)
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(old_handler)
+            loop.set_debug(old_debug)
+        self.assertEqual(errors, [])
+        self.assertTrue(harness._queue.empty())
+
     async def test_pinned_elicitation_dispatcher_waits_for_consumer_ack(self):
         response_started = asyncio.Event()
         response_release = asyncio.Event()
@@ -643,6 +738,9 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         cancel_requested=False,
         invocation_id="invocation",
         framework_input_id="framework-input",
+        native_input_id=None,
+        mode=None,
+        prompt="initial",
     ):
         cancel_event = asyncio.Event()
         shutdown_event = asyncio.Event()
@@ -650,12 +748,17 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             cancel_event.set()
         if shutdown:
             shutdown_event.set()
+        task_input = {
+            "invocation_id": invocation_id,
+            "prompt": prompt,
+            "session_id": "session",
+        }
+        if native_input_id is not None:
+            task_input["input_id"] = native_input_id
+        if mode is not None:
+            task_input["mode"] = mode
         return SimpleNamespace(
-            input={
-                "invocation_id": invocation_id,
-                "prompt": "initial",
-                "session_id": "session",
-            },
+            input=task_input,
             entry_mode=entry_mode,
             input_id=framework_input_id,
             recovery_count=1 if entry_mode == "recovered" else 0,
@@ -938,6 +1041,10 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "different prompt"):
                 await agent.submit_native_input(
                     "session", "input-1", "different", "immediate"
+                )
+            with self.assertRaisesRegex(ValueError, "different prompt or mode"):
+                await agent.submit_native_input(
+                    "session", "input-1", "follow up", "enqueue"
                 )
             with self.assertRaisesRegex(ValueError, "exceed 512 KiB"):
                 await agent.submit_native_input(
@@ -1234,14 +1341,43 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         _, _, _, _ = await self.run_task(
-            context=self.context(entry_mode="recovered"),
+            context=self.context(
+                entry_mode="recovered",
+                native_input_id="accepted",
+                mode="enqueue",
+                prompt="accepted prompt",
+            ),
             state=state,
             restore_side_effect=restore,
         )
         harness = ImmediateHarness.instances[-1]
-        self.assertEqual(
-            harness.sent[:2], [("initial", None), ("accepted prompt", "enqueue")]
-        )
+        self.assertEqual(harness.sent, [("accepted prompt", "enqueue")])
+
+    async def test_existing_accepted_input_rejects_prompt_and_mode_conflicts(self):
+        state = {
+            "input_journal": [
+                {
+                    "input_id": "accepted",
+                    "prompt": "original",
+                    "mode": "enqueue",
+                    "status": "accepted",
+                }
+            ]
+        }
+        for prompt, mode in (("different", "enqueue"), ("original", "immediate")):
+            with self.subTest(prompt=prompt, mode=mode):
+                agent._HARNESS_SLOTS.clear()
+                ImmediateHarness.instances.clear()
+                with self.assertRaisesRegex(ValueError, "different prompt or mode"):
+                    await self.run_task(
+                        context=self.context(
+                            native_input_id="accepted",
+                            prompt=prompt,
+                            mode=mode,
+                        ),
+                        state=state,
+                    )
+                self.assertEqual(ImmediateHarness.instances[-1].sent, [])
 
     async def test_recovered_hitl_decisions_remain_until_idle_and_keep_empty_accept(
         self,
@@ -1392,6 +1528,57 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(json.loads(response.body)["error"], "invalid_request")
+
+    async def test_explicit_invalid_input_ids_are_rejected_not_regenerated(self):
+        with patch.object(main.copilot_agent, "start", AsyncMock()) as start:
+            for value in ("", None, 0, False):
+                with self.subTest(value=value):
+                    response = await main.handle_invoke(
+                        self.request(
+                            {"input": "hello", "input_id": value},
+                            session_id="session",
+                        )
+                    )
+                    self.assertEqual(response.status_code, 400)
+            start.assert_not_awaited()
+
+    async def test_absent_input_id_is_generated_once(self):
+        generated = uuid.UUID("00000000-0000-0000-0000-000000000123")
+        stream = SimpleNamespace()
+        with patch.object(main.uuid, "uuid4", return_value=generated), patch.object(
+            main, "submit_native_input", AsyncMock(return_value=None)
+        ), patch.object(
+            main.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            main.copilot_agent, "start", AsyncMock()
+        ) as start, patch.object(
+            main, "reserve_harness"
+        ):
+            response = await main.handle_invoke(
+                self.request({"input": "hello"}, session_id="session")
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            start.call_args.kwargs["input"]["input_id"],
+            str(generated),
+        )
+
+    async def test_non_string_elicitation_ids_are_rejected(self):
+        with patch.object(main, "submit_elicitation_decision", AsyncMock()) as submit:
+            for value in (None, 0, False):
+                with self.subTest(value=value):
+                    response = await main.handle_elicit(
+                        self.request(
+                            {
+                                "session_id": "session",
+                                "elicitation_id": value,
+                                "action": "accept",
+                            },
+                            session_id="session",
+                        )
+                    )
+                    self.assertEqual(response.status_code, 400)
+            submit.assert_not_awaited()
 
     async def test_no_live_harness_falls_back_to_framework_durable_turn(self):
         request = self.request(

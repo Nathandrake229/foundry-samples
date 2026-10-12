@@ -132,7 +132,9 @@ receipt can require replay; this is at-least-once processing, not an exactly-onc
 message or effect guarantee.
 
 Callers may supply a stable `input_id` for native follow-up retries. Conflicting
-content for the same ID is rejected. The unfinished-input journal is bounded
+content for the same ID is rejected before checking its delivery status.
+An absent ID is generated; an explicitly invalid value is rejected.
+The unfinished-input journal is bounded
 to 32 entries and 512 KiB of JSON; it is not an unbounded message queue.
 Once a harness enters closing, further inputs use a framework-durable next
 turn instead of being sent to the closing subprocess.
@@ -141,6 +143,11 @@ The native-send adapter uses the pinned SDK's reader-thread response callback
 to separate an old queued idle notification from completion of newly submitted
 work. This is a version-specific integration covered by ordering tests; keep
 the dependency lock and those tests together when upgrading the SDK.
+
+SDK reader-thread callbacks are marshalled onto the harness's owning event
+loop before touching its asyncio queue. Cancelling a send also cancels and
+awaits its outstanding receiver; an item dequeued concurrently must be retained
+in order, not discarded during cleanup.
 
 ## Human in the loop
 

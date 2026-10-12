@@ -110,9 +110,11 @@ $env:AGENTSERVER_STATE_ROOT = Join-Path $env:TEMP 'copilot-state'
 ```
 
 The `input_id` field is optional. Supply a stable ID when retrying a native
-follow-up so the persisted receipt can identify the same request. Reusing an
-ID with a different prompt or mode is rejected. The unfinished-input journal
-is bounded to 32 entries and 512 KiB of JSON; wait for work to finish before
+follow-up so the persisted receipt can identify the same request. An ID is
+generated only when the field is absent; explicit empty or non-string values
+are rejected. Reusing an ID with a different prompt or mode is rejected even
+while the original input is still accepted but not delivered. The unfinished-input
+journal is bounded to 32 entries and 512 KiB of JSON; wait for work to finish before
 submitting more when that bound is reached.
 
 While the harness is ready, `immediate` and `enqueue` use Copilot's native

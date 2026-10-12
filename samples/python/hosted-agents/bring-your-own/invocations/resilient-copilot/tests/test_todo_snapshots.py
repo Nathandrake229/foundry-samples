@@ -18,7 +18,7 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "resilient-copilot"
 sys.path.insert(0, str(SRC))
 
 from copilot_session import CopilotHarness, TodoCheckpointRequest
-from store import SessionSnapshotStore, todo_fingerprint
+from store import SessionSnapshotStore, SnapshotTooLargeError, todo_fingerprint
 
 
 def create_todos(workspace: Path) -> sqlite3.Connection:
@@ -215,6 +215,7 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
         with patch.dict(os.environ, {"AGENTSERVER_STATE_ROOT": self.tmp.name}):
             self.agent = importlib.import_module("agent")
 
@@ -228,6 +229,8 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
             send = AsyncMock()
             abort = AsyncMock()
             close = AsyncMock()
+            stop_accepting_controls = lambda self: None
+            bind_recovered_elicitations = lambda self, markers: None
 
             async def events(self):
                 yield request
@@ -251,11 +254,21 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
             set_item=AsyncMock(),
             aclose=AsyncMock(),
         )
-        snapshot = SimpleNamespace(save=AsyncMock())
+        snapshot = SimpleNamespace(
+            save=AsyncMock(), restore=AsyncMock(return_value=False)
+        )
+        expected_exception = None
         if checkpoint_failure:
-            snapshot.save.side_effect = OSError("live snapshot failed")
+            failure = (
+                checkpoint_failure
+                if isinstance(checkpoint_failure, BaseException)
+                else OSError("live snapshot failed")
+            )
+            snapshot.save.side_effect = failure
+            expected_exception = type(failure)
         elif final_failure:
             snapshot.save.side_effect = [None, OSError("final snapshot failed")]
+            expected_exception = OSError
         context = SimpleNamespace(
             input={"invocation_id": "test-inv", "prompt": "test", "session_id": "test"},
             entry_mode="fresh",
@@ -266,15 +279,19 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.agent, "CopilotHarness", Harness), patch.object(
             self.agent, "_SNAPSHOT_STORE", snapshot
         ), patch.object(
+            self.agent, "_CONFIG_ROOT", self.root / "task-config"
+        ), patch.object(
             self.agent.streams, "get_or_create", AsyncMock(return_value=stream)
         ), patch.object(
             self.agent.FoundryStateStore,
             "get_or_create",
             AsyncMock(return_value=state_store),
+        ), patch.object(
+            self.agent, "_get_legacy_state_item", AsyncMock(return_value=None)
         ):
             handler = self.agent.copilot_agent._fn
-            if checkpoint_failure or final_failure:
-                with self.assertRaises(OSError):
+            if expected_exception is not None:
+                with self.assertRaises(expected_exception):
                     await handler(context)
             else:
                 await handler(context)
@@ -291,10 +308,21 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state_store.set_item.call_args.args[1]["has_snapshot"])
 
     async def test_failed_live_checkpoint_fails_turn_without_completion(self):
-        _, stream, _ = await self.exercise_task(checkpoint_failure=True)
+        _, stream, state_store = await self.exercise_task(checkpoint_failure=True)
         self.assertEqual(
             [frame["type"] for frame in stream.frames], ["turn_start", "turn_failed"]
         )
+        for call in state_store.set_item.call_args_list:
+            self.assertNotIn("has_snapshot", call.args[1])
+
+    async def test_oversized_checkpoint_does_not_set_snapshot_marker(self):
+        failure = SnapshotTooLargeError("5 MiB serialized JSON limit")
+        _, stream, state_store = await self.exercise_task(checkpoint_failure=failure)
+        self.assertEqual(
+            [frame["type"] for frame in stream.frames], ["turn_start", "turn_failed"]
+        )
+        for call in state_store.set_item.call_args_list:
+            self.assertNotIn("has_snapshot", call.args[1])
 
     async def test_failed_final_snapshot_does_not_emit_turn_complete(self):
         _, stream, _ = await self.exercise_task(final_failure=True)

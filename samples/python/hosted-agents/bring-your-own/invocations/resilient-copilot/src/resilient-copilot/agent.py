@@ -1,104 +1,235 @@
-"""The resilient Copilot task — long-running, crash-recoverable, steerable, HITL.
-
-A single ``@multi_turn_task`` supervises the lifecycle of one GitHub Copilot
-session. The Copilot SDK is the real agent brain (model + tool loop); this task
-is the *durable host* around it. It provides exactly what the Copilot SDK does
-not:
-
-* **Long-running / no-ingress survival** — while the Copilot agent grinds
-  through a (possibly minutes-long) tool loop, the task is ``in_progress``, so
-  the platform keeps the container alive even with the client disconnected.
-* **Crash recovery** — on a restarted container the framework re-invokes this
-  task with ``ctx.entry_mode == "recovered"``; we call ``resume_session`` (the
-  Copilot CLI persisted the workspace to disk) instead of creating a new one,
-  emit a ``recovered`` marker onto the SAME file-backed stream, and re-drive
-  the turn so it completes.
-* **Reconnectable streaming** — every Copilot ``SessionEvent`` is emitted onto
-  a file-backed replay stream with a monotonic ``sequence_number``; a client
-  that dropped reconnects via ``?last_event_id=N`` and sees the gap with no
-  loss (``main.py``).
-* **Durable HITL marker** — when the model raises an elicitation, we persist a
-  marker in an explicit ``FoundryStateStore`` so the human-in-the-loop pause is
-  re-drivable after a crash even though the in-memory Future is gone.
-* **Todo checkpoints** — after a tool changes the todo list, dependencies or
-  plan file, save a live session snapshot before acknowledging the tool hook.
-
-Steering (``send(mode="immediate")``) and queueing (``send(mode="enqueue")``)
-are delivered *directly to the live Copilot session* from ``main.py`` while a
-turn is in flight — Copilot supports graceful intra-turn redirection natively,
-so we do not route them through the framework's cancel-and-re-enter steering
-queue. The task ``start()`` is used only to begin a turn (fresh) or to resume
-the conversation on a later turn / after a crash.
-"""
+"""Resilient task supervisor for one durable GitHub Copilot session."""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import json
 import logging
 import os
+from pathlib import Path
+import shutil
+import tempfile
 from typing import Any
 
-from pathlib import Path
-
 from azure.ai.agentserver.core import resolve_state_subdir
-from azure.ai.agentserver.core.storage import FoundryStateStore
+from azure.ai.agentserver.core.storage import (
+    FoundryStateStore,
+    FoundryStorageNotFoundError,
+)
 from azure.ai.agentserver.core.streaming import streams
 from azure.ai.agentserver.core.tasks import TaskContext, multi_turn_task
 
 try:
-    from .copilot_session import CopilotHarness, TodoCheckpointRequest
-    from .store import SessionSnapshotStore
+    from .copilot_session import (
+        CopilotHarness,
+        ElicitationDecisionRequest,
+        ElicitationRequest,
+        HarnessClosingError,
+        NativeInputRequest,
+        TodoCheckpointRequest,
+    )
+    from .store import (
+        SessionSnapshotStore,
+        session_storage_key,
+        validate_session_id,
+    )
 except ImportError:  # allow `python main.py` from inside this directory
-    from copilot_session import CopilotHarness, TodoCheckpointRequest
-    from store import SessionSnapshotStore
+    from copilot_session import (
+        CopilotHarness,
+        ElicitationDecisionRequest,
+        ElicitationRequest,
+        HarnessClosingError,
+        NativeInputRequest,
+        TodoCheckpointRequest,
+    )
+    from store import SessionSnapshotStore, session_storage_key, validate_session_id
 
 logger = logging.getLogger(__name__)
 
+_SNAPSHOT_STORE = SessionSnapshotStore(resolve_state_subdir("copilot-snapshots"))
+_CONFIG_ROOT = resolve_state_subdir("copilot-sessions")
+_SIMULATE_CRASH_AFTER_EVENTS = int(os.environ.get("SIMULATE_CRASH_AFTER_EVENTS", "-1"))
+_MAX_INPUT_JOURNAL_ENTRIES = 32
+_MAX_INPUT_JOURNAL_BYTES = 512 * 1024
+_READY_TIMEOUT_SECONDS = 15
+
 
 def session_state_store_name(session_id: str) -> str:
-    """Name of the FoundryStateStore holding this session's small markers.
-
-    ``ctx.metadata`` was removed from the resilient-task primitive, so durable
-    application state (here: the pending-elicitation marker and the
-    snapshot-exists flag) lives in an explicit conversation-scoped
-    ``FoundryStateStore`` instead.
-    """
-    return f"copilot-state-{session_id}"
+    """Return a bounded store name for this session's durable control state."""
+    return f"copilot-state-{session_storage_key(session_id)}"
 
 
-# Live harnesses keyed by session id, so the HTTP layer can deliver steering /
-# queued inputs and elicitation answers to the in-flight Copilot session.
-_HARNESSES: dict[str, CopilotHarness] = {}
-
-# Durable snapshot store for the Copilot session workspace (StateStore-backed on
-# hosted, file fallback offline). Makes the conversation survive a container
-# REPLACEMENT, not just an in-process restart. See store.py.
-_SNAPSHOT_STORE = SessionSnapshotStore(resolve_state_subdir("copilot-snapshots"))
-
-# Root under which each session's Copilot config_dir lives (one isolated
-# SQLite session store per session id). Kept under the shared, operator-managed
-# state root so it sits alongside the framework's tasks/ and streams/.
-_CONFIG_ROOT = resolve_state_subdir("copilot-sessions")
+def _legacy_session_state_store_name(session_id: str) -> str:
+    return f"copilot-state-{validate_session_id(session_id)}"
 
 
 def _config_dir_for(session_id: str) -> Path:
-    """Per-session Copilot config_dir (its own SQLite store + session-state)."""
-    return _CONFIG_ROOT / session_id
+    """Return a confined per-session Copilot configuration directory."""
+    return _CONFIG_ROOT / session_storage_key(session_id)
 
 
-# Optional local crash simulation: after this many events are emitted, hard-crash
-# (os._exit) so a restart exercises the resume_session() recovery path. A real
-# SIGKILL/OOM is identical from the task's perspective. Unset in production.
-_SIMULATE_CRASH_AFTER_EVENTS = int(os.environ.get("SIMULATE_CRASH_AFTER_EVENTS", "-1"))
+def _migrate_legacy_config_dir(session_id: str, target: Path) -> bool:
+    """Copy a validated pre-hash config directory into the confined hash path."""
+    validate_session_id(session_id)
+    root = _CONFIG_ROOT.resolve()
+    legacy = (_CONFIG_ROOT / session_id).resolve()
+    if not legacy.is_relative_to(root) or not (legacy / "session-store.db").is_file():
+        return False
+    for item in legacy.rglob("*"):
+        if item.is_symlink():
+            raise ValueError("Legacy Copilot session directory contains a symlink")
+
+    _CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=_CONFIG_ROOT, prefix=f"{session_storage_key(session_id)}-migrate-"
+    ) as staging_root:
+        staged = Path(staging_root) / "config"
+        shutil.copytree(legacy, staged)
+        if not (staged / "session-store.db").is_file():
+            raise FileNotFoundError("Migrated legacy session has no session-store.db")
+        if target.exists():
+            shutil.rmtree(target)
+        staged.replace(target)
+    return True
 
 
-def get_harness(session_id: str) -> CopilotHarness | None:
-    """Return the live harness for a session, if a turn is currently active."""
-    return _HARNESSES.get(session_id)
+def _elicitations(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    markers = state.get("elicitations")
+    if markers is None:
+        markers = {}
+        legacy = state.get("pending_elicitation")
+        if isinstance(legacy, dict) and legacy.get("elicitation_id"):
+            markers[str(legacy["elicitation_id"])] = dict(legacy)
+        state["elicitations"] = markers
+    if not isinstance(markers, dict) or not all(
+        isinstance(key, str) and isinstance(value, dict)
+        for key, value in markers.items()
+    ):
+        raise ValueError("Durable elicitation state is corrupt")
+    return markers
+
+
+def _sync_pending_elicitation(state: dict[str, Any]) -> None:
+    markers = _elicitations(state)
+    latest_id = next(reversed(markers), None)
+    state["pending_elicitation"] = markers.get(latest_id) if latest_id else None
+
+
+def _confirm_submitted_elicitations(state: dict[str, Any]) -> None:
+    markers = _elicitations(state)
+    for elicitation_id in [
+        key for key, marker in markers.items() if marker.get("delivery") == "submitted"
+    ]:
+        del markers[elicitation_id]
+    _sync_pending_elicitation(state)
+
+
+async def _get_legacy_state_item(session_id: str) -> Any:
+    legacy_state_store = FoundryStateStore(_legacy_session_state_store_name(session_id))
+    try:
+        try:
+            return await legacy_state_store.get_item("state")
+        except FoundryStorageNotFoundError:
+            return None
+    finally:
+        await legacy_state_store.aclose()
+
+
+@dataclass
+class _HarnessSlot:
+    ready: asyncio.Future[CopilotHarness]
+    closing: bool = False
+
+
+_HARNESS_SLOTS: dict[str, _HarnessSlot] = {}
+_CLIENT_CANCEL_REQUESTED: set[str] = set()
+
+
+def reserve_harness(session_id: str) -> _HarnessSlot:
+    """Reserve startup routing before ``task.start()`` returns to the caller."""
+    validate_session_id(session_id)
+    current = _HARNESS_SLOTS.get(session_id)
+    if current is not None and not current.closing:
+        return current
+    slot = _HarnessSlot(asyncio.get_running_loop().create_future())
+    _HARNESS_SLOTS[session_id] = slot
+    return slot
+
+
+def fail_harness_start(session_id: str, exc: BaseException) -> None:
+    """Unblock rapid follow-ups when starting the durable task failed."""
+    slot = _HARNESS_SLOTS.get(session_id)
+    if slot is None:
+        return
+    slot.closing = True
+    if not slot.ready.done():
+        slot.ready.set_exception(exc)
+        slot.ready.exception()
+    _HARNESS_SLOTS.pop(session_id, None)
+
+
+async def _ready_harness(session_id: str) -> CopilotHarness | None:
+    slot = _HARNESS_SLOTS.get(session_id)
+    if slot is None or slot.closing:
+        return None
+    try:
+        harness = await asyncio.wait_for(
+            asyncio.shield(slot.ready), _READY_TIMEOUT_SECONDS
+        )
+    except (TimeoutError, HarnessClosingError):
+        return None
+    if slot.closing:
+        return None
+    return harness
+
+
+async def submit_native_input(
+    session_id: str, input_id: str, prompt: str, mode: str
+) -> dict[str, Any] | None:
+    """Route a follow-up through the active task consumer, if one is usable."""
+    validate_session_id(session_id)
+    harness = await _ready_harness(session_id)
+    if harness is None:
+        return None
+    try:
+        return await harness.queue_input(input_id, prompt, mode)
+    except HarnessClosingError:
+        return None
+
+
+async def submit_elicitation_decision(
+    session_id: str,
+    elicitation_id: str,
+    action: str,
+    content: dict | None,
+) -> dict[str, Any] | None:
+    """Route an HITL answer through the active task's durable control queue."""
+    validate_session_id(session_id)
+    harness = await _ready_harness(session_id)
+    if harness is None:
+        return None
+    try:
+        return await harness.queue_elicitation_decision(elicitation_id, action, content)
+    except HarnessClosingError:
+        return None
+
+
+def mark_client_cancel(session_id: str) -> None:
+    """Record an explicit HTTP cancellation independently of framework flags."""
+    validate_session_id(session_id)
+    _CLIENT_CANCEL_REQUESTED.add(session_id)
+
+
+def _consume_client_cancel(session_id: str) -> bool:
+    if session_id in _CLIENT_CANCEL_REQUESTED:
+        _CLIENT_CANCEL_REQUESTED.remove(session_id)
+        return True
+    return False
 
 
 def _event_payload(event: Any) -> dict:
-    """Render a Copilot SessionEvent as a stream payload (cursor added by emit)."""
+    """Render a Copilot SessionEvent as a stream payload."""
     try:
         body = event.to_dict()
     except Exception:  # pylint: disable=broad-except
@@ -106,71 +237,248 @@ def _event_payload(event: Any) -> dict:
     return {"kind": "copilot_event", **body}
 
 
+def _input_journal(state: dict[str, Any]) -> list[dict[str, Any]]:
+    journal = state.setdefault("input_journal", [])
+    if not isinstance(journal, list):
+        raise ValueError("Durable input journal is corrupt")
+    return journal
+
+
+def _decision_message(elicitation_id: str, action: str, content: dict | None) -> str:
+    payload: dict[str, Any] = {
+        "elicitation_id": elicitation_id,
+        "action": action,
+    }
+    if content is not None:
+        payload["content"] = content
+    return f"[human elicitation response] {json.dumps(payload, sort_keys=True)}"
+
+
 @multi_turn_task(name="copilot_agent", steerable=True)
 async def copilot_agent(ctx: TaskContext[dict]) -> None:
-    """Supervise one Copilot turn end-to-end with full resilience.
-
-    Input: ``{"prompt": str, "session_id": str, "invocation_id": str,
-    "call_id": str | None}``. Progress is read from the per-turn SSE stream, not
-    the task's return value; the body returns ``None`` so the steerable chain
-    stays alive for subsequent turns.
-    """
-    session_id: str = ctx.input["session_id"]
+    """Supervise one Copilot turn and durably serialize native controls."""
+    session_id = validate_session_id(str(ctx.input["session_id"]))
     inv_id: str = ctx.input["invocation_id"]
     prompt: str = ctx.input["prompt"]
     recovered = ctx.entry_mode == "recovered"
     config_dir = _config_dir_for(session_id)
-
-    # Durable session markers (pending elicitation + snapshot-exists flag) live
-    # in an explicit FoundryStateStore now that ctx.metadata is gone. It uses a
-    # local file-backed fallback automatically when not hosted, so it also works
-    # offline. Load the current markers once; persist on change.
-    state_store = await FoundryStateStore.get_or_create(
-        session_state_store_name(session_id),
-        description="Copilot session markers (pending elicitation, snapshot ref)",
-    )
-    state_item = await state_store.get_item("state")
-    state: dict = (
-        dict(state_item.value)
-        if state_item is not None and isinstance(state_item.value, dict)
-        else {}
-    )
-
-    stream = await streams.get_or_create(inv_id)
-    # On recovery, last_cursor() is the highest sequence_number that reached
-    # disk before the crash, so the client's reconnect skips nothing.
-    last_cursor = await stream.last_cursor()
-    seq = last_cursor or 0
-
-    async def emit(payload: dict) -> None:
-        nonlocal seq
-        seq += 1
-        await stream.emit({"sequence_number": seq, **payload})
-
+    slot = reserve_harness(session_id)
     harness = CopilotHarness()
-    _HARNESSES[session_id] = harness
-
-    async def on_elicit_request(
-        elicitation_id: str, message: str, schema: dict
-    ) -> None:
-        # Persist a durable marker so a crash while parked on this elicitation
-        # is re-drivable in the next lifetime (the in-memory Future is not).
-        state["pending_elicitation"] = {
-            "elicitation_id": elicitation_id,
-            "message": message,
-            "schema": schema,
-        }
-        await state_store.set_item("state", state)
-        await emit(
-            {
-                "type": "elicitation_request",
-                "elicitation_id": elicitation_id,
-                "message": message,
-                "schema": schema,
-            }
-        )
+    stream = None
+    state_store = None
+    watcher: asyncio.Task[None] | None = None
+    seq = 0
 
     try:
+        if not (config_dir / "session-store.db").exists():
+            await asyncio.to_thread(_migrate_legacy_config_dir, session_id, config_dir)
+        state_store = await FoundryStateStore.get_or_create(
+            session_state_store_name(session_id),
+            item_ttl_seconds=30 * 24 * 60 * 60,
+            description="Copilot durable controls and snapshot marker",
+        )
+        state_item = await state_store.get_item("state")
+        legacy_state_migrated = False
+        if state_item is None:
+            state_item = await _get_legacy_state_item(session_id)
+            legacy_state_migrated = state_item is not None
+        state: dict[str, Any] = (
+            dict(state_item.value)
+            if state_item is not None and isinstance(state_item.value, dict)
+            else {}
+        )
+        _elicitations(state)
+        _sync_pending_elicitation(state)
+        if legacy_state_migrated:
+            await state_store.set_item("state", state)
+
+        stream = await streams.get_or_create(inv_id)
+        seq = await stream.last_cursor() or 0
+
+        async def emit(payload: dict[str, Any]) -> None:
+            nonlocal seq
+            seq += 1
+            await stream.emit({"sequence_number": seq, **payload})
+
+        async def persist_state() -> None:
+            await state_store.set_item("state", state)
+
+        async def save_snapshot(*, live: bool) -> None:
+            await _SNAPSHOT_STORE.save(session_id, config_dir, live=live)
+            state["has_snapshot"] = True
+            await persist_state()
+
+        async def process_elicitation_request(request: ElicitationRequest) -> None:
+            try:
+                markers = _elicitations(state)
+                existing = markers.get(request.elicitation_id, {})
+                markers[request.elicitation_id] = {
+                    "elicitation_id": request.elicitation_id,
+                    "message": request.message,
+                    "schema": request.schema,
+                    "decision": existing.get("decision"),
+                    "delivery": existing.get("delivery"),
+                }
+                _sync_pending_elicitation(state)
+                await persist_state()
+                await emit(
+                    {
+                        "type": "elicitation_request",
+                        "elicitation_id": request.elicitation_id,
+                        "message": request.message,
+                        "schema": request.schema,
+                    }
+                )
+            except BaseException as exc:
+                if not request.acknowledged.done():
+                    request.acknowledged.set_exception(exc)
+                raise
+            else:
+                if not request.acknowledged.done():
+                    request.acknowledged.set_result(None)
+
+        async def process_native_input(request: NativeInputRequest) -> None:
+            try:
+                journal = _input_journal(state)
+                record = next(
+                    (
+                        entry
+                        for entry in journal
+                        if entry.get("input_id") == request.input_id
+                    ),
+                    None,
+                )
+                if record is not None and record.get("status") == "delivered":
+                    if (
+                        record.get("prompt") != request.prompt
+                        or record.get("mode") != request.mode
+                    ):
+                        error = ValueError(
+                            "input_id is already bound to a different prompt or mode"
+                        )
+                        if not request.acknowledged.done():
+                            request.acknowledged.set_exception(error)
+                        return
+                    result = {
+                        "status": "delivered",
+                        "input_id": request.input_id,
+                        "deduplicated": True,
+                    }
+                else:
+                    if record is None:
+                        unfinished = [
+                            entry
+                            for entry in journal
+                            if entry.get("status") != "covered"
+                        ]
+                        if len(unfinished) >= _MAX_INPUT_JOURNAL_ENTRIES:
+                            error = RuntimeError(
+                                "Durable native-input journal is full; wait for the "
+                                "current Copilot turn to reach idle before retrying."
+                            )
+                            if not request.acknowledged.done():
+                                request.acknowledged.set_exception(error)
+                            return
+                        record = {
+                            "input_id": request.input_id,
+                            "prompt": request.prompt,
+                            "mode": request.mode,
+                            "status": "accepted",
+                        }
+                        journal.append(record)
+                        journal_size = len(
+                            json.dumps(journal, separators=(",", ":")).encode("utf-8")
+                        )
+                        if journal_size > _MAX_INPUT_JOURNAL_BYTES:
+                            journal.pop()
+                            error = ValueError(
+                                "Durable native-input journal would exceed 512 KiB; "
+                                "send a smaller input or wait for the current turn "
+                                "to reach idle."
+                            )
+                            if not request.acknowledged.done():
+                                request.acknowledged.set_exception(error)
+                            return
+                        await persist_state()
+                    await harness.send(
+                        record["prompt"],
+                        mode=record["mode"],
+                        causal_idle=True,
+                    )
+                    await save_snapshot(live=True)
+                    record["status"] = "delivered"
+                    await persist_state()
+                    result = {
+                        "status": "delivered",
+                        "input_id": request.input_id,
+                        "deduplicated": False,
+                    }
+                if not request.acknowledged.done():
+                    request.acknowledged.set_result(result)
+            except BaseException as exc:
+                if not request.acknowledged.done():
+                    request.acknowledged.set_exception(exc)
+                raise
+
+        async def deliver_elicitation_decision(
+            elicitation_id: str, action: str, content: dict | None
+        ) -> str:
+            live = harness.answer_elicitation(elicitation_id, action, content)
+            if live:
+                delivery = "answered"
+            else:
+                await harness.send(
+                    _decision_message(elicitation_id, action, content),
+                    mode="enqueue",
+                    causal_idle=True,
+                )
+                delivery = "delivered_as_message"
+            harness.discard_recovered_elicitation(elicitation_id)
+            await save_snapshot(live=True)
+            marker = _elicitations(state).get(elicitation_id)
+            if (
+                marker is not None
+                and (marker.get("decision") or {}).get("action") == action
+            ):
+                marker["delivery"] = "submitted"
+            _sync_pending_elicitation(state)
+            await persist_state()
+            return delivery
+
+        async def process_elicitation(
+            request: ElicitationDecisionRequest,
+        ) -> None:
+            try:
+                marker = _elicitations(state).get(request.elicitation_id)
+                if marker is None:
+                    error = ValueError(
+                        "elicitation_id does not match the pending request"
+                    )
+                    if not request.acknowledged.done():
+                        request.acknowledged.set_exception(error)
+                    return
+                marker["decision"] = {
+                    "action": request.action,
+                    "content": request.content,
+                }
+                marker["delivery"] = "accepted"
+                _sync_pending_elicitation(state)
+                await persist_state()
+                delivery = await deliver_elicitation_decision(
+                    request.elicitation_id, request.action, request.content
+                )
+                if not request.acknowledged.done():
+                    request.acknowledged.set_result(
+                        {
+                            "status": delivery,
+                            "elicitation_id": request.elicitation_id,
+                        }
+                    )
+            except BaseException as exc:
+                if not request.acknowledged.done():
+                    request.acknowledged.set_exception(exc)
+                raise
+
         await emit(
             {
                 "type": "turn_start",
@@ -180,148 +488,205 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
             }
         )
 
-        # CONTAINER-DURABLE RECOVERY: on a recovered re-entry the local disk may
-        # be gone (container replacement), so restore the last good Copilot
-        # session snapshot from the durable StateStore INTO config_dir before
-        # resume_session reads it. On a fresh turn nothing is restored.
-        if recovered:
-            await _SNAPSHOT_STORE.restore(session_id, config_dir)
-
-        # Resume whenever a session store is present on disk (either a
-        # same-container follow-up turn, or one we just restored); otherwise
-        # this is the first turn for the session and we create it fresh.
         have_session = (config_dir / "session-store.db").exists()
+        if not have_session:
+            restored = await _SNAPSHOT_STORE.restore(session_id, config_dir)
+            if state.get("has_snapshot") and not restored:
+                raise FileNotFoundError(
+                    "Durable state says a Copilot snapshot exists, but it could "
+                    "not be restored. Refusing to create a new conversation."
+                )
+            have_session = restored and (config_dir / "session-store.db").exists()
+            if restored and not have_session:
+                raise FileNotFoundError(
+                    "Restored Copilot snapshot has no session-store.db"
+                )
+
+        elicitation_markers = list(_elicitations(state).values())
+        harness.bind_recovered_elicitations(elicitation_markers)
+
         await harness.start(
             session_id,
             recover=have_session,
-            on_elicit_request=on_elicit_request,
             config_directory=str(config_dir),
         )
+        if not slot.ready.done():
+            slot.ready.set_result(harness)
 
         if recovered:
             await emit({"type": "recovered", "recovery_count": ctx.recovery_count})
-            pending = state.get("pending_elicitation")
-            if pending:
-                # Re-surface the unanswered question so a reconnecting client
-                # knows we are still waiting on them (see README caveat).
+            for marker in elicitation_markers:
+                if marker.get("decision"):
+                    continue
                 await emit(
-                    {"type": "elicitation_request", "recovered": True, **pending}
+                    {
+                        "type": "elicitation_request",
+                        "recovered": True,
+                        **marker,
+                    }
                 )
 
-        # Deliver the prompt. On recovery we re-drive the same prompt: the
-        # Copilot conversation history is restored by resume_session, so the
-        # model continues in context (some streamed content may repeat, but the
-        # stream has no gap — see README "Crash recovery").
-        await harness.send(prompt)
+        await harness.send(prompt, causal_idle=True)
 
-        # When cancel/shutdown fires while the pump is blocked waiting for the
-        # next event, abort the Copilot turn so the agent winds down and the
-        # pump unblocks. The in-loop check below handles the case where the
-        # signal arrives between events.
-        async def _watch_stop() -> None:
-            done, pending = await asyncio.wait(
-                {
-                    asyncio.create_task(ctx.cancel.wait()),
-                    asyncio.create_task(ctx.shutdown.wait()),
-                },
-                return_when=asyncio.FIRST_COMPLETED,
+        # Re-drive controls that were durably accepted but not covered by a
+        # completed Copilot idle boundary. A crash after send and before the
+        # receipt update can therefore deliver at least twice.
+        for record in list(_input_journal(state)):
+            if record.get("status") in {"accepted", "delivered"}:
+                await harness.send(
+                    record["prompt"],
+                    mode=record["mode"],
+                    causal_idle=True,
+                )
+                await save_snapshot(live=True)
+                record["status"] = "delivered"
+                await persist_state()
+
+        for marker in list(_elicitations(state).values()):
+            decision = marker.get("decision")
+            if not decision:
+                continue
+            await deliver_elicitation_decision(
+                marker["elicitation_id"],
+                decision["action"],
+                decision.get("content"),
             )
-            for task in pending:
-                task.cancel()
-            await harness.abort()
 
-        watcher = asyncio.create_task(_watch_stop())
+        async def watch_stop() -> None:
+            cancel_wait = asyncio.create_task(ctx.cancel.wait())
+            shutdown_wait = asyncio.create_task(ctx.shutdown.wait())
+            try:
+                await asyncio.wait(
+                    {cancel_wait, shutdown_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                await harness.abort()
+            finally:
+                for child in (cancel_wait, shutdown_wait):
+                    if not child.done():
+                        child.cancel()
+                await asyncio.gather(cancel_wait, shutdown_wait, return_exceptions=True)
 
-        try:
-            async for event in harness.events():
-                if ctx.cancel.is_set() or ctx.shutdown.is_set():
-                    break
-                if isinstance(event, TodoCheckpointRequest):
-                    try:
-                        await _SNAPSHOT_STORE.save(session_id, config_dir, live=True)
-                        state["has_snapshot"] = True
-                        state["todo_fingerprint"] = event.fingerprint
-                        await state_store.set_item("state", state)
-                        logger.info(
-                            "copilot_todo_checkpoint_saved session=%s fingerprint=%s",
-                            session_id,
-                            event.fingerprint,
-                        )
-                        await emit(
-                            {
-                                "type": "todo_checkpoint",
-                                "fingerprint": event.fingerprint,
-                            }
-                        )
-                    except Exception as exc:
-                        if not event.acknowledged.done():
-                            event.acknowledged.set_exception(exc)
-                        raise
-                    else:
-                        if not event.acknowledged.done():
-                            event.acknowledged.set_result(None)
-                    continue
-                await emit(_event_payload(event))
-                _maybe_crash(seq)
-        finally:
-            watcher.cancel()
+        watcher = asyncio.create_task(watch_stop())
+        async for event in harness.events():
+            if ctx.cancel.is_set() or ctx.shutdown.is_set():
+                break
+            if isinstance(event, TodoCheckpointRequest):
+                try:
+                    await save_snapshot(live=True)
+                    state["todo_fingerprint"] = event.fingerprint
+                    await persist_state()
+                    await emit(
+                        {
+                            "type": "todo_checkpoint",
+                            "fingerprint": event.fingerprint,
+                        }
+                    )
+                except BaseException as exc:
+                    if not event.acknowledged.done():
+                        event.acknowledged.set_exception(exc)
+                    raise
+                else:
+                    if not event.acknowledged.done():
+                        event.acknowledged.set_result(None)
+                continue
+            if isinstance(event, ElicitationRequest):
+                await process_elicitation_request(event)
+                continue
+            if isinstance(event, NativeInputRequest):
+                await process_native_input(event)
+                continue
+            if isinstance(event, ElicitationDecisionRequest):
+                await process_elicitation(event)
+                continue
+            await emit(_event_payload(event))
+            _maybe_crash(seq, enabled=not recovered)
 
-        clean_completion = not (ctx.cancel.is_set() or ctx.shutdown.is_set())
-        if not clean_completion:
-            await harness.abort()
-            await emit({"type": "cancelled"})
-        else:
-            # Turn finished cleanly — clear any answered elicitation marker.
-            if state.get("pending_elicitation"):
-                state["pending_elicitation"] = None
-                await state_store.set_item("state", state)
+        explicit_cancel = _consume_client_cancel(session_id) or bool(
+            getattr(ctx, "cancel_requested", False)
+        )
+        shutting_down = ctx.shutdown.is_set() and not explicit_cancel
+        cancelled = ctx.cancel.is_set() and not shutting_down
 
-        # DURABLE SNAPSHOT: stop the Copilot client first so the SQLite WAL is
-        # checkpointed and the on-disk session store is consistent, THEN copy
-        # config_dir into the StateStore so the conversation survives a
-        # container replacement. Keep only a tiny reference in the state store.
+        slot.closing = True
+        harness.stop_accepting_controls()
+        await harness.abort()
         await harness.close()
-        await _SNAPSHOT_STORE.save(session_id, config_dir)
-        state["has_snapshot"] = True
-        await state_store.set_item("state", state)
-        if clean_completion:
-            await emit({"type": "turn_complete"})
+        await save_snapshot(live=False)
 
-        # Close the wire stream so SSE subscribers see the terminator. NOT done
-        # on the crash path below: the stream must stay open for the recovery
-        # re-entry to continue emitting to the same cursor with no gap.
+        if shutting_down:
+            return await ctx.exit_for_recovery()
+
+        if cancelled:
+            state["input_journal"] = []
+            state["elicitations"] = {}
+            state["pending_elicitation"] = None
+            await persist_state()
+            await emit({"type": "cancelled"})
+            await stream.close()
+            return
+
+        journal = _input_journal(state)
+        for record in journal:
+            if record.get("status") == "delivered":
+                record["status"] = "covered"
+        state["input_journal"] = [
+            record for record in journal if record.get("status") != "covered"
+        ]
+        _confirm_submitted_elicitations(state)
+        await persist_state()
+        await emit({"type": "turn_complete"})
         await stream.close()
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("copilot_agent turn failed; emitting terminal frame")
-        try:
-            await emit(
-                {
-                    "type": "turn_failed",
-                    "error": {"type": type(exc).__name__, "message": str(exc)[:2000]},
-                }
-            )
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("failed to emit terminal turn_failed frame")
-        # Close on a logical failure so subscribers fast-fail. A true crash
-        # (os._exit/SIGKILL) never reaches here, so its stream stays open for
-        # the recovery re-entry.
-        try:
-            await stream.close()
-        except Exception:  # pylint: disable=broad-except
-            pass
+        if not slot.ready.done():
+            slot.ready.set_exception(exc)
+            slot.ready.exception()
+        if stream is not None:
+            try:
+                seq += 1
+                await stream.emit(
+                    {
+                        "sequence_number": seq,
+                        "type": "turn_failed",
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc)[:2000],
+                        },
+                    }
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("failed to emit terminal turn_failed frame")
+            try:
+                await stream.close()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("failed to close failed turn stream")
         raise
     finally:
+        slot.closing = True
+        if not slot.ready.done():
+            slot.ready.set_exception(
+                HarnessClosingError("Copilot harness closed before becoming ready")
+            )
+            slot.ready.exception()
+        harness.stop_accepting_controls()
+        if watcher is not None:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
         await harness.close()
-        try:
-            await state_store.aclose()
-        except Exception:  # pylint: disable=broad-except
-            pass
-        _HARNESSES.pop(session_id, None)
+        if state_store is not None:
+            try:
+                await state_store.aclose()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("failed to close Copilot state store")
+        if _HARNESS_SLOTS.get(session_id) is slot:
+            _HARNESS_SLOTS.pop(session_id, None)
+        _CLIENT_CANCEL_REQUESTED.discard(session_id)
 
 
-def _maybe_crash(emitted: int) -> None:
-    """Hard-crash after N emitted events when the crash hook is armed."""
-    if 0 <= _SIMULATE_CRASH_AFTER_EVENTS <= emitted:
+def _maybe_crash(emitted: int, *, enabled: bool = True) -> None:
+    """Hard-crash after N emitted events when the one-shot hook is armed."""
+    if enabled and 0 <= _SIMULATE_CRASH_AFTER_EVENTS <= emitted:
         logger.warning(
             "SIMULATE_CRASH_AFTER_EVENTS=%d reached (emitted=%d); os._exit(1).",
             _SIMULATE_CRASH_AFTER_EVENTS,

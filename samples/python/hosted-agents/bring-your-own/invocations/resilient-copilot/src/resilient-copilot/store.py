@@ -37,21 +37,105 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tarfile
 import tempfile
 import time
-from pathlib import Path
+import zlib
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# One store per agent for its Copilot session snapshots. Item keys are the
-# session ids; items expire after an hour so abandoned snapshots don't
-# accumulate.
-_STORE_NAME = "copilot-session-snapshots"
-_ITEM_TTL_SECONDS = 3600
+# Version the store name because get_or_create cannot update the immutable TTL
+# of the previously published one-hour store. Restore still checks the legacy
+# store so existing snapshots are not abandoned.
+_STORE_NAME = "copilot-session-snapshots-v2"
+_LEGACY_STORE_NAME = "copilot-session-snapshots"
+_ITEM_TTL_SECONDS = 30 * 24 * 60 * 60
+_MAX_STATE_VALUE_BYTES = 5 * 1024 * 1024
+_STATE_VALUE_JSON_OVERHEAD = len(
+    json.dumps({"tar_gz_b64": ""}, separators=(",", ":")).encode("utf-8")
+)
+_MAX_BASE64_CHARS = ((_MAX_STATE_VALUE_BYTES - _STATE_VALUE_JSON_OVERHEAD) // 4) * 4
+_MAX_ARCHIVE_BYTES = (_MAX_BASE64_CHARS // 4) * 3
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+
+
+class SnapshotTooLargeError(ValueError):
+    """The serialized StateStore value exceeds the service's hard maximum."""
+
+
+def _snapshot_too_large_error() -> SnapshotTooLargeError:
+    return SnapshotTooLargeError(
+        "Copilot session snapshot exceeds Foundry StateStore's 5 MiB serialized "
+        "JSON value limit. Reduce the session workspace before retrying. "
+        "Deployments without StateStore value offload may also reject values "
+        "above 1 MiB."
+    )
+
+
+class _SizeLimitedBytesIO(io.BytesIO):
+    """Bytes buffer that fails before its retained compressed output exceeds a cap."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__()
+        self._max_bytes = max_bytes
+        self._size = 0
+
+    def write(self, data: bytes) -> int:
+        projected_size = max(self._size, self.tell() + len(data))
+        if projected_size > self._max_bytes:
+            raise _snapshot_too_large_error()
+        written = super().write(data)
+        self._size = projected_size
+        return written
+
+
+class _GzipBuffer:
+    """Streaming gzip writer backed by an optionally size-limited buffer."""
+
+    def __init__(self, max_bytes: int | None) -> None:
+        self._buffer = (
+            _SizeLimitedBytesIO(max_bytes) if max_bytes is not None else io.BytesIO()
+        )
+        self._compressor = zlib.compressobj(level=9, wbits=31)
+        self._position = 0
+
+    def write(self, data: bytes) -> int:
+        compressed = self._compressor.compress(data)
+        if compressed:
+            self._buffer.write(compressed)
+        self._position += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self._position
+
+    def finish(self) -> None:
+        compressed = self._compressor.flush()
+        if compressed:
+            self._buffer.write(compressed)
+
+    def getvalue(self) -> bytes:
+        return self._buffer.getvalue()
+
+
+def validate_session_id(session_id: str) -> str:
+    """Validate a Foundry session id before using it in any boundary API."""
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(
+            "session_id must be 1-120 ASCII letters, digits, underscores, or hyphens"
+        )
+    return session_id
+
+
+def session_storage_key(session_id: str) -> str:
+    """Return a stable, bounded filesystem key for an external session id."""
+    validate_session_id(session_id)
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
 
 def _is_lockfile(name: str) -> bool:
@@ -105,12 +189,30 @@ def _sqlite_backup(src: Path, dst: Path) -> None:
         source.backup(target, pages=128, progress=progress, sleep=0.01)
 
 
-def _pack_dir(src: Path, *, live: bool = False) -> bytes:
+def _complete_jsonl_prefix_size(path: Path) -> int:
+    """Return the byte length through the final complete JSONL record."""
+    size = path.stat().st_size
+    with path.open("rb") as source:
+        position = size
+        while position:
+            chunk_size = min(position, 64 * 1024)
+            position -= chunk_size
+            source.seek(position)
+            chunk = source.read(chunk_size)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return position + newline + 1
+    return 0
+
+
+def _pack_dir(
+    src: Path, *, live: bool = False, max_archive_bytes: int | None = None
+) -> bytes:
     """Return a gzip'd tar of *src*'s contents (excluding stale lock files)."""
-    buf = io.BytesIO()
+    output = _GzipBuffer(max_archive_bytes)
     with tempfile.TemporaryDirectory(prefix="copilot-snapshot-") as staging:
         stage = Path(staging)
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        with tarfile.open(fileobj=output, mode="w|") as tar:
             for item in sorted(src.rglob("*")):
                 if not item.is_file() or _is_lockfile(item.name):
                     continue
@@ -121,25 +223,47 @@ def _pack_dir(src: Path, *, live: bool = False) -> bytes:
                     backup = stage / relative
                     backup.parent.mkdir(parents=True, exist_ok=True)
                     _sqlite_backup(item, backup)
-                    tar.add(backup, arcname=str(relative))
+                    tar.add(backup, arcname=relative.as_posix())
                 elif live and item.suffix == ".jsonl":
-                    content = item.read_bytes()
-                    content = content[: content.rfind(b"\n") + 1]
-                    info = tarfile.TarInfo(str(relative))
-                    info.size = len(content)
-                    tar.addfile(info, io.BytesIO(content))
+                    info = tarfile.TarInfo(relative.as_posix())
+                    info.size = _complete_jsonl_prefix_size(item)
+                    with item.open("rb") as source:
+                        tar.addfile(info, source)
                 else:
-                    tar.add(item, arcname=str(relative))
-    return buf.getvalue()
+                    tar.add(item, arcname=relative.as_posix())
+    output.finish()
+    return output.getvalue()
 
 
 def _unpack_dir(blob: bytes, dst: Path) -> None:
     """Restore a gzip'd tar *blob* into *dst* (created fresh)."""
-    if dst.exists():
-        shutil.rmtree(dst, ignore_errors=True)
-    dst.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-        tar.extractall(dst)  # noqa: S202 - trusted, self-produced archive
+        members = tar.getmembers()
+        for member in members:
+            original_name = member.name
+            name = original_name.replace("\\", "/")
+            path = PurePosixPath(name)
+            if (
+                not name
+                or path.is_absolute()
+                or ".." in path.parts
+                or PureWindowsPath(original_name).drive
+                or member.issym()
+                or member.islnk()
+                or not (member.isfile() or member.isdir())
+            ):
+                raise ValueError(f"Unsafe snapshot archive member: {original_name!r}")
+            member.name = name
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            dir=dst.parent, prefix=f"{dst.name}-restore-"
+        ) as staging_name:
+            staging = Path(staging_name)
+            tar.extractall(staging, members=members, filter="data")
+            if dst.exists():
+                shutil.rmtree(dst)
+            staging.replace(dst)
 
 
 class SessionSnapshotStore:
@@ -152,6 +276,7 @@ class SessionSnapshotStore:
         # fall back to the local file store for the offline demo.
         self._use_state_store = bool(os.environ.get("FOUNDRY_PROJECT_ENDPOINT"))
         self._store: Any = None
+        self._legacy_store: Any = None
 
     async def _state_store(self) -> Any:
         """Lazily resolve (or create) the Foundry StateStore for this agent."""
@@ -166,6 +291,16 @@ class SessionSnapshotStore:
             )
         return self._store
 
+    async def _legacy_state_store(self) -> Any:
+        """Bind the old store without creating it, solely for migration reads."""
+        if self._legacy_store is None:
+            from azure.ai.agentserver.core.storage import (  # noqa: PLC0415
+                FoundryStateStore,
+            )
+
+            self._legacy_store = FoundryStateStore(_LEGACY_STORE_NAME)
+        return self._legacy_store
+
     async def save(
         self, session_id: str, config_dir: Path, *, live: bool = False
     ) -> None:
@@ -174,27 +309,40 @@ class SessionSnapshotStore:
         Use ``live=True`` while the CLI is running to back up SQLite databases
         and exclude incomplete JSONL records. Otherwise close the CLI first.
         """
+        validate_session_id(session_id)
         if not config_dir.exists():
             raise FileNotFoundError(
                 f"Copilot session directory not found: {config_dir}"
             )
-        blob = await asyncio.to_thread(_pack_dir, config_dir, live=live)
+        blob = await asyncio.to_thread(
+            _pack_dir,
+            config_dir,
+            live=live,
+            max_archive_bytes=_MAX_ARCHIVE_BYTES if self._use_state_store else None,
+        )
         if self._use_state_store:
             store = await self._state_store()
             # StateStore item values are JSON objects, so base64 the archive.
-            await store.set_item(
-                session_id, {"tar_gz_b64": base64.b64encode(blob).decode("ascii")}
-            )
+            encoded = base64.b64encode(blob).decode("ascii")
+            value = {"tar_gz_b64": encoded}
+            serialized_size = _STATE_VALUE_JSON_OVERHEAD + len(encoded)
+            if serialized_size > _MAX_STATE_VALUE_BYTES:
+                raise _snapshot_too_large_error()
+            await store.set_item(session_id, value)
             logger.info(
-                "Saved Copilot session snapshot to StateStore (%d bytes) for %s",
+                "Saved Copilot session snapshot to StateStore "
+                "(%d archive bytes, %d serialized bytes) for %s",
                 len(blob),
+                serialized_size,
                 session_id,
             )
             return
 
         target = self._path(session_id)
         fd, tmp = tempfile.mkstemp(
-            dir=str(self._base), prefix=f"{session_id}_", suffix=".tgz"
+            dir=str(self._base),
+            prefix=f"{session_storage_key(session_id)}_",
+            suffix=".tgz",
         )
         try:
             with open(fd, "wb") as fh:
@@ -210,16 +358,29 @@ class SessionSnapshotStore:
         Returns True if a snapshot was found and restored, else False (a fresh
         session should be created).
         """
+        validate_session_id(session_id)
         blob: bytes | None = None
         if self._use_state_store:
             store = await self._state_store()
             item = await store.get_item(session_id)
+            if item is None:
+                from azure.ai.agentserver.core.storage import (  # noqa: PLC0415
+                    FoundryStorageNotFoundError,
+                )
+
+                legacy = await self._legacy_state_store()
+                try:
+                    item = await legacy.get_item(session_id)
+                except FoundryStorageNotFoundError:
+                    item = None
             if item is not None:
                 encoded = (item.value or {}).get("tar_gz_b64")
                 if encoded:
                     blob = base64.b64decode(encoded)
         else:
             path = self._path(session_id)
+            if not path.exists():
+                path = self._legacy_path(session_id)
             if path.exists():
                 blob = path.read_bytes()
 
@@ -233,6 +394,7 @@ class SessionSnapshotStore:
 
     async def delete(self, session_id: str) -> None:
         """Remove the snapshot for *session_id* if present; no-op otherwise."""
+        validate_session_id(session_id)
         if self._use_state_store:
             from azure.ai.agentserver.core.storage import (  # noqa: PLC0415
                 FoundryStorageNotFoundError,
@@ -248,6 +410,21 @@ class SessionSnapshotStore:
         path = self._path(session_id)
         if path.exists():
             path.unlink()
+        legacy = self._legacy_path(session_id)
+        if legacy.exists():
+            legacy.unlink()
 
     def _path(self, session_id: str) -> Path:
+        return self._base / f"{session_storage_key(session_id)}.tgz"
+
+    def _legacy_path(self, session_id: str) -> Path:
+        """Return the pre-hash filename for migration of already-valid ids."""
         return self._base / f"{session_id}.tgz"
+
+    async def aclose(self) -> None:
+        """Close any StateStore clients created by this snapshot store."""
+        for store in (self._store, self._legacy_store):
+            if store is not None:
+                await store.aclose()
+        self._store = None
+        self._legacy_store = None

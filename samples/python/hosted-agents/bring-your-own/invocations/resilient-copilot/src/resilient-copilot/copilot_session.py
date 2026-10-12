@@ -29,7 +29,8 @@ import asyncio
 import logging
 import os
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections import deque
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from copilot import (
     PostToolUseHookOutput,
     ProviderConfig,
 )
+from copilot._telemetry import get_trace_context
 from copilot.session_events import SessionEventType
 
 try:
@@ -50,13 +52,47 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Callback the task registers so an elicitation request (raised by the model
-# mid-turn) is surfaced to the client and persisted durably. Receives
-# (elicitation_id, message, requested_schema).
-ElicitRequestCallback = Callable[[str, str, dict], Awaitable[None]]
 
-# Sentinel end-of-stream marker pushed onto the queue when the agent goes idle.
-_IDLE = object()
+class CopilotSessionError(RuntimeError):
+    """The Copilot event stream reported a terminal session error."""
+
+
+class HarnessClosingError(RuntimeError):
+    """The harness cannot accept another control request."""
+
+
+@dataclass
+class NativeInputRequest:
+    input_id: str
+    prompt: str
+    mode: str
+    acknowledged: asyncio.Future[dict[str, Any]]
+
+
+@dataclass
+class ElicitationDecisionRequest:
+    elicitation_id: str
+    action: str
+    content: dict | None
+    acknowledged: asyncio.Future[dict[str, Any]]
+
+
+@dataclass
+class ElicitationRequest:
+    elicitation_id: str
+    message: str
+    schema: dict
+    acknowledged: asyncio.Future[None]
+
+
+@dataclass
+class IdleBoundary:
+    event: Any
+
+
+@dataclass
+class ResponseBoundary:
+    token: object
 
 
 @dataclass
@@ -72,40 +108,46 @@ class CopilotHarness:
         self._client: CopilotClient | None = None
         self.session: Any = None
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._deferred_events: deque[Any] = deque()
         self._unsubscribe: Callable[[], None] | None = None
         # elicitation_id -> Future[ElicitationResult]
         self._pending_elicitations: dict[str, asyncio.Future] = {}
-        self._on_elicit_request: ElicitRequestCallback | None = None
+        self._pending_elicitation_requests: set[asyncio.Future[None]] = set()
         self._workspace: Path | None = None
         self._todo_fingerprint: str | None = None
         self._checkpoint_lock = asyncio.Lock()
         self._pending_checkpoints: set[asyncio.Future[None]] = set()
+        self._pending_controls: set[asyncio.Future[dict[str, Any]]] = set()
+        self._accepting_controls = True
+        self._credential: Any = None
+        self._recovered_elicitations: list[dict[str, Any]] = []
 
     # -- backend selection ---------------------------------------------------
 
-    @staticmethod
-    def _byok_provider() -> tuple[Any | None, str | None]:
+    def _byok_provider(self) -> tuple[Any | None, str | None]:
         """Return (ProviderConfig, model) for BYOK mode, else (None, None).
 
-        Mints a Managed-Identity bearer token for the Foundry project endpoint.
-        NOTE: the token is minted once at session creation; for a genuinely
-        multi-hour run you would refresh it (out of scope for this sample).
+        The Copilot runtime invokes ``bearer_token_provider`` for every model
+        request. Azure Identity owns token caching and refresh.
         """
         endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")
         model = os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME", "")
         if not endpoint or not model:
             return None, None
 
-        from azure.identity import DefaultAzureCredential  # noqa: PLC0415
+        from azure.identity.aio import DefaultAzureCredential  # noqa: PLC0415
 
-        token = (
-            DefaultAzureCredential().get_token("https://ai.azure.com/.default").token
-        )
+        self._credential = DefaultAzureCredential()
+
+        async def token_provider(_args: dict[str, str]) -> str:
+            token = await self._credential.get_token("https://ai.azure.com/.default")
+            return token.token
+
         provider = ProviderConfig(
             type="azure",
             base_url=endpoint,
             wire_api="responses",
-            bearer_token=token,
+            bearer_token_provider=token_provider,
         )
         return provider, model
 
@@ -125,7 +167,6 @@ class CopilotHarness:
         session_id: str,
         *,
         recover: bool,
-        on_elicit_request: ElicitRequestCallback | None = None,
         working_directory: str | None = None,
         config_directory: str | None = None,
     ) -> None:
@@ -133,14 +174,13 @@ class CopilotHarness:
 
         :param recover: When True, ``resume_session`` rehydrates the session
             from ``config_dir`` after a crash; when False, a new session is
-            created. Resume falls back to create if no persisted session exists.
+            created. Resume failures propagate and never create a replacement
+            conversation.
         :param config_directory: The Copilot CLI configuration directory where the
             session (its SQLite ``session-store.db`` + ``session-state/`` tree)
             is persisted. Point this at a per-session, durable-store-backed path
             so ``resume_session`` can rehydrate after a container restart.
         """
-        self._on_elicit_request = on_elicit_request
-
         provider, model = self._byok_provider()
         github_token = os.environ.get("GITHUB_TOKEN")
         if provider:
@@ -152,70 +192,79 @@ class CopilotHarness:
                 "Set GITHUB_TOKEN (Copilot model) or FOUNDRY_PROJECT_ENDPOINT + "
                 "AZURE_AI_MODEL_DEPLOYMENT_NAME (BYOK Foundry model)."
             )
-        await self._client.start()
+        try:
+            await self._client.start()
 
-        common: dict[str, Any] = dict(
-            on_permission_request=PermissionHandler.approve_all,
-            on_elicitation_request=self._elicitation_handler,
-            streaming=True,
-            provider=provider,
-            model=model,
-            working_directory=working_directory or os.path.expanduser("~"),
-            hooks={"on_post_tool_use": self._post_tool_use},
-        )
-        if config_directory is not None:
-            os.makedirs(config_directory, exist_ok=True)
-            common["config_directory"] = config_directory
+            common: dict[str, Any] = dict(
+                on_permission_request=PermissionHandler.approve_all,
+                on_elicitation_request=self._elicitation_handler,
+                streaming=True,
+                provider=provider,
+                model=model,
+                working_directory=working_directory or os.path.expanduser("~"),
+                hooks={"on_post_tool_use": self._post_tool_use},
+            )
+            if config_directory is not None:
+                os.makedirs(config_directory, exist_ok=True)
+                common["config_directory"] = config_directory
 
-        if recover:
-            try:
+            if recover:
                 self.session = await self._client.resume_session(session_id, **common)
                 logger.info("Resumed Copilot session: %s", session_id)
-            except Exception:  # pylint: disable=broad-except
-                # No persisted session yet (e.g. the first turn) — create one.
-                logger.info(
-                    "No session to resume for %s; creating a fresh session.", session_id
-                )
+            else:
                 self.session = await self._client.create_session(
                     session_id=session_id, **common
                 )
-        else:
-            self.session = await self._client.create_session(
-                session_id=session_id, **common
-            )
-            logger.info("Created Copilot session: %s", session_id)
+                logger.info("Created Copilot session: %s", session_id)
 
-        workspace = self.session.workspace_path
-        if workspace is None:
-            raise RuntimeError(
-                "Copilot did not provide a workspace for todo checkpoints"
+            workspace = self.session.workspace_path
+            if workspace is None:
+                raise RuntimeError(
+                    "Copilot did not provide a workspace for todo checkpoints"
+                )
+            self._workspace = Path(workspace).resolve()
+            if config_directory is not None and not self._workspace.is_relative_to(
+                Path(config_directory).resolve()
+            ):
+                raise RuntimeError(
+                    "Copilot workspace is outside the snapshot directory"
+                )
+            self._todo_fingerprint = await asyncio.to_thread(
+                todo_fingerprint, self._workspace
             )
-        self._workspace = Path(workspace).resolve()
-        if config_directory is not None and not self._workspace.is_relative_to(
-            Path(config_directory).resolve()
-        ):
-            raise RuntimeError("Copilot workspace is outside the snapshot directory")
-        self._todo_fingerprint = await asyncio.to_thread(
-            todo_fingerprint, self._workspace
-        )
-        self._unsubscribe = self.session.on(self._on_event)
+            self._unsubscribe = self.session.on(self._on_event)
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         """Tear down the subscription and stop the CLI client."""
+        self._accepting_controls = False
         for pending in self._pending_checkpoints:
+            pending.cancel()
+        for pending in self._pending_elicitation_requests:
+            pending.cancel()
+        for pending in self._pending_controls:
+            if not pending.done():
+                pending.set_exception(HarnessClosingError("Copilot harness is closing"))
+        for pending in self._pending_elicitations.values():
             pending.cancel()
         if self._unsubscribe is not None:
             try:
                 self._unsubscribe()
             except Exception:  # pylint: disable=broad-except
-                pass
+                logger.exception("failed to unsubscribe Copilot session events")
             self._unsubscribe = None
         if self._client is not None:
             try:
                 await self._client.stop()
             except Exception:  # pylint: disable=broad-except
-                pass
+                logger.exception("failed to stop Copilot client")
             self._client = None
+        credential = self._credential
+        self._credential = None
+        if credential is not None:
+            await credential.close()
 
     # -- event pump ----------------------------------------------------------
 
@@ -244,23 +293,178 @@ class CopilotHarness:
 
     def _on_event(self, event: Any) -> None:
         """SDK event callback → push onto the queue (idle terminates a turn)."""
-        self._queue.put_nowait(event)
-        if getattr(event, "type", None) == SessionEventType.SESSION_IDLE:
-            self._queue.put_nowait(_IDLE)
+        event_type = getattr(event, "type", None)
+        if event_type == SessionEventType.SESSION_IDLE:
+            self._queue.put_nowait(IdleBoundary(event))
+        else:
+            self._queue.put_nowait(event)
+        if event_type == SessionEventType.SESSION_ERROR:
+            self._queue.put_nowait(
+                CopilotSessionError(
+                    str(getattr(event, "data", "Copilot session error"))
+                )
+            )
 
     async def events(self) -> AsyncGenerator[Any, None]:
         """Yield ``SessionEvent`` objects until the agent goes idle."""
         while True:
-            item = await self._queue.get()
-            if item is _IDLE:
+            item = await self._next_event()
+            if isinstance(item, IdleBoundary):
+                yield item.event
                 return
+            if isinstance(item, CopilotSessionError):
+                raise item
             yield item
+
+    async def _next_event(self) -> Any:
+        if self._deferred_events:
+            return self._deferred_events.popleft()
+        return await self._queue.get()
+
+    def _restore_deferred(self, items: list[Any]) -> None:
+        self._deferred_events.extendleft(reversed(items))
 
     # -- messaging -----------------------------------------------------------
 
-    async def send(self, prompt: str, *, mode: str | None = None) -> str:
+    async def send(
+        self,
+        prompt: str,
+        *,
+        mode: str | None = None,
+        causal_idle: bool = False,
+    ) -> str:
         """Send a message. ``mode`` is ``"immediate"`` (steer) or ``"enqueue"``."""
-        return await self.session.send(prompt, mode=mode)
+        if self.session is None:
+            raise HarnessClosingError("Copilot session is not ready")
+        if not causal_idle:
+            return await self.session.send(prompt, mode=mode)
+        return await self._send_after_stale_idle_barrier(prompt, mode)
+
+    async def _send_after_stale_idle_barrier(
+        self, prompt: str, mode: str | None
+    ) -> str:
+        """Discard every idle boundary preceding the reader-thread response."""
+        client = getattr(self.session, "_client", None)
+        if client is None or not hasattr(client, "request"):
+            return await self._send_with_local_idle_barrier(prompt, mode)
+
+        buffered: list[Any] = []
+        loop = asyncio.get_running_loop()
+        token = object()
+
+        def mark_response_boundary(_result: Any) -> None:
+            loop.call_soon_threadsafe(
+                self._queue.put_nowait,
+                ResponseBoundary(token),
+            )
+
+        params: dict[str, Any] = {
+            "sessionId": self.session.session_id,
+            "prompt": prompt,
+        }
+        if mode is not None:
+            params["mode"] = mode
+        params.update(get_trace_context())
+        send_task = asyncio.create_task(
+            client.request(
+                "session.send",
+                params,
+                on_response_inline=mark_response_boundary,
+            )
+        )
+        try:
+            while True:
+                receive_task = asyncio.create_task(self._next_event())
+                done, _ = await asyncio.wait(
+                    {send_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if send_task in done and send_task.exception() is not None:
+                    receive_task.cancel()
+                    await asyncio.gather(receive_task, return_exceptions=True)
+                    send_task.result()
+
+                if receive_task in done:
+                    item = receive_task.result()
+                    if isinstance(item, ResponseBoundary) and item.token is token:
+                        response = await send_task
+                        return response["messageId"]
+                    if not isinstance(item, IdleBoundary):
+                        buffered.append(item)
+                else:
+                    receive_task.cancel()
+                    await asyncio.gather(receive_task, return_exceptions=True)
+        finally:
+            if not send_task.done():
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+            self._restore_deferred(buffered)
+
+    async def _send_with_local_idle_barrier(self, prompt: str, mode: str | None) -> str:
+        """Fallback for test/session doubles without the pinned RPC client."""
+        buffered: list[Any] = []
+        while self._deferred_events:
+            item = self._deferred_events.popleft()
+            if not isinstance(item, IdleBoundary):
+                buffered.append(item)
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(item, IdleBoundary):
+                buffered.append(item)
+        try:
+            return await self.session.send(prompt, mode=mode)
+        finally:
+            self._restore_deferred(buffered)
+
+    async def queue_input(
+        self, input_id: str, prompt: str, mode: str
+    ) -> dict[str, Any]:
+        """Queue a native input for durable handling by the task consumer."""
+        request = NativeInputRequest(
+            input_id,
+            prompt,
+            mode,
+            asyncio.get_running_loop().create_future(),
+        )
+        return await self._queue_control(request)
+
+    async def queue_elicitation_decision(
+        self,
+        elicitation_id: str,
+        action: str,
+        content: dict | None,
+    ) -> dict[str, Any]:
+        """Queue an HITL decision for context-safe durable handling."""
+        request = ElicitationDecisionRequest(
+            elicitation_id,
+            action,
+            content,
+            asyncio.get_running_loop().create_future(),
+        )
+        return await self._queue_control(request)
+
+    async def _queue_control(
+        self, request: NativeInputRequest | ElicitationDecisionRequest
+    ) -> dict[str, Any]:
+        if not self._accepting_controls:
+            raise HarnessClosingError("Copilot harness is closing")
+        future = request.acknowledged
+        self._pending_controls.add(future)
+        self._queue.put_nowait(request)
+        try:
+            return await future
+        finally:
+            self._pending_controls.discard(future)
+
+    def stop_accepting_controls(self) -> None:
+        """Reject new control requests and unblock requests behind an idle."""
+        self._accepting_controls = False
+        for pending in self._pending_controls:
+            if not pending.done():
+                pending.set_exception(HarnessClosingError("Copilot harness is closing"))
 
     async def abort(self) -> None:
         """Abort the in-flight turn (cooperative cancel of the Copilot agent)."""
@@ -272,12 +476,11 @@ class CopilotHarness:
     async def _elicitation_handler(self, elicit_ctx: Any) -> Any:
         """Registered ``on_elicitation_request`` callback.
 
-        Surfaces the request to the client (via the task's callback), persists a
-        durable marker, then blocks on a Future until the client answers through
+        Queues the request for the task consumer to persist and acknowledge,
+        then blocks on a Future until the client answers through
         ``answer_elicitation``. On any failure it returns ``cancel`` so the
         Copilot CLI never hangs.
         """
-        elicitation_id = str(uuid.uuid4())
         message = ""
         schema: dict = {}
         if isinstance(elicit_ctx, dict):
@@ -286,14 +489,30 @@ class CopilotHarness:
         else:  # object form
             message = str(getattr(elicit_ctx, "message", ""))
             schema = dict(getattr(elicit_ctx, "requestedSchema", {}) or {})
+        elicitation_id = str(uuid.uuid4())
+        for index, recovered in enumerate(self._recovered_elicitations):
+            if (
+                recovered.get("message") == message
+                and recovered.get("schema") == schema
+            ):
+                elicitation_id = str(recovered["elicitation_id"])
+                self._recovered_elicitations.pop(index)
+                break
 
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_elicitations[elicitation_id] = fut
 
         try:
-            if self._on_elicit_request is not None:
-                await self._on_elicit_request(elicitation_id, message, schema)
+            acknowledged = asyncio.get_running_loop().create_future()
+            self._pending_elicitation_requests.add(acknowledged)
+            self._queue.put_nowait(
+                ElicitationRequest(elicitation_id, message, schema, acknowledged)
+            )
+            try:
+                await acknowledged
+            finally:
+                self._pending_elicitation_requests.discard(acknowledged)
             result = await fut
             return result
         except asyncio.CancelledError:
@@ -321,6 +540,17 @@ class CopilotHarness:
             result["content"] = content
         fut.set_result(result)
         return True
+
+    def bind_recovered_elicitations(self, markers: list[dict[str, Any]]) -> None:
+        """Reuse durable ids if the SDK recreates elicitation callbacks."""
+        self._recovered_elicitations = [dict(marker) for marker in markers]
+
+    def discard_recovered_elicitation(self, elicitation_id: str) -> None:
+        self._recovered_elicitations = [
+            marker
+            for marker in self._recovered_elicitations
+            if marker.get("elicitation_id") != elicitation_id
+        ]
 
     def has_live_elicitation(self, elicitation_id: str) -> bool:
         """True if the given elicitation is currently parked in this process."""

@@ -27,10 +27,10 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 | **Long-running / no-ingress survival** | Work keeps running past idle-eviction even with no client connected. | While the Copilot agent grinds through a (possibly minutes-long) tool loop, the task is `in_progress`, so the platform keeps the container alive. |
 | **Crash recovery** | A replacement container restores the latest saved Copilot session. | On recovered entry, the task restores the session snapshot from `FoundryStateStore` before calling `resume_session(session_id)` and re-driving the prompt. Uncheckpointed work can repeat. |
 | **Todo/plan checkpoints** | Todo progress is saved during a turn, not just at its end. | After a tool changes todo rows, dependencies or `plan.md`, a post-tool hook waits for a live session snapshot. The stream emits `todo_checkpoint` after persistence succeeds. |
-| **Steering** | A new input redirects the in-flight turn instead of racing it. | `POST` with `{"mode":"immediate"}` while a turn is active → `session.send(prompt, mode="immediate")` on the live Copilot session. |
-| **Queueing** | A follow-up input runs after the current turn. | `POST` with `{"mode":"enqueue"}` → `session.send(prompt, mode="enqueue")`. |
+| **Steering** | A new input redirects the in-flight turn instead of racing it. | Accepted inputs are persisted before HTTP acknowledgement and delivered through Copilot's native `send(mode="immediate")`. Interrupted delivery can replay. |
+| **Queueing** | A follow-up input runs after the current turn. | Durable acceptance and native `send(mode="enqueue")` preserve follow-ups; recovery is at-least-once, not exactly-once delivery. |
 | **Streaming with reconnect** | Clients reconnect after a drop or crash with no gap. | Every Copilot `SessionEvent` is emitted onto a **file-backed** replay stream with a monotonic `sequence_number`; reconnect via `GET … ?last_event_id=N`. |
-| **Human-in-the-loop (HITL)** | Pause indefinitely for approval, resume on the human's reply. | The model's `on_elicitation_request` parks a Future and emits an `elicitation_request` event; the human answers via `POST /elicit`; a durable marker in `FoundryStateStore` makes the pause re-drivable after a crash. |
+| **Human-in-the-loop (HITL)** | Ask for a decision and preserve the pending question across restarts. | The model emits an elicitation request and the human answers via `POST /elicit`. The question ID and action are validated and persisted; the running turn's watchdog still applies. |
 
 > The GitHub Copilot SDK gives you a durable, steerable **brain**. The resilient
 > task gives you a self-healing, single-writer, survivable, reconnectable
@@ -91,11 +91,30 @@ This agent supports two LLM backends (same selection logic as the
 
 ```bash
 cd src/resilient-copilot
-uv sync            # creates .venv from pyproject.toml and uv.lock
+uv sync --frozen    # creates .venv from the committed dependency lock
 az login   # for the BYOK Foundry-model path (Managed Identity)
 cp .env.example .env  # then edit
-uv run python main.py   # listens on http://localhost:8088
+uv run --frozen python main.py   # listens on http://localhost:8088
 ```
+
+On native Windows, keep `AGENTSERVER_STATE_ROOT` short if the CLI reports
+`unable to open database file`: session-directory names and SQLite WAL/SHM
+suffixes can push a long root beyond the native SQLite path limit. For example:
+
+```powershell
+$env:AGENTSERVER_STATE_ROOT = Join-Path $env:TEMP 'copilot-state'
+```
+
+The `input_id` field is optional. Supply a stable ID when retrying a native
+follow-up so the persisted receipt can identify the same request. Reusing an
+ID with a different prompt or mode is rejected. The unfinished-input journal
+is bounded to 32 entries and 512 KiB of JSON; wait for work to finish before
+submitting more when that bound is reached.
+
+While the harness is ready, `immediate` and `enqueue` use Copilot's native
+controls. During startup, follow-ups wait for readiness. A request arriving
+after the harness enters closing becomes a durable next turn; it cannot
+redirect a turn that has already ended.
 
 ### 1) Stream a turn (with reconnect)
 
@@ -172,13 +191,25 @@ Recovery re-drives the prompt with the saved plan, rather than resuming a live
 instruction pointer.
 
 The latest snapshot is also saved after the client closes. In hosted execution
-it is a State Store item; offline execution uses a local archive. Snapshot
-retention remains one hour from its latest write.
+it is a State Store item; offline execution uses a local archive. The default
+snapshot retention is 30 days from its latest write, separate from task
+retention.
+
+New writes use the versioned 30-day snapshot store. Recovery can still read
+legacy snapshots while their original retention permits it; a previously
+expired snapshot cannot be recovered by extending the new store's lifetime.
+
+The serialized snapshot value is bounded at 5 MiB, including base64 overhead.
+Values above 1 MiB require the service's managed value offload; that path stores
+the value through Dataset-backed blob storage and hydrates it on reads. With
+offload disabled, the service can reject values above 1 MiB. No additional
+Blob Storage resource is created by this sample, and oversized or rejected
+snapshots fail explicitly.
 
 Run the focused tests from the sample root:
 
 ```bash
-uv run --project src/resilient-copilot python -m unittest discover -s tests -v
+uv run --frozen --project src/resilient-copilot python -m unittest discover -s tests -v
 ```
 
 > **Why `os._exit` and not a "simulate shutdown" flag?** Crash recovery is the
@@ -200,17 +231,17 @@ A human-in-the-loop pause spans four pieces of state: the durable task, the
 durable stream, the **live Copilot subprocess** (holding the pending
 elicitation), and an in-memory Future in this host.
 
-- **Idle-eviction (no traffic) is fully survivable.** The container is not
-  killed; the task holds `in_progress`; the model waits on the pending
-  elicitation indefinitely. Whenever the human answers — minutes or hours
-  later — the turn continues. Nothing is lost.
+- **No client traffic does not itself end an active turn.** The task holds
+  `in_progress` while the model waits on an elicitation. The turn watchdog and
+  platform lifecycle still apply; this is not an unlimited durable human wait.
 - **A hard crash while parked on an elicitation** kills the live subprocess and
   the in-memory Future. On recovery `resume_session` restores the conversation
   and stream, and this sample re-surfaces the pending question from the durable
   `FoundryStateStore` marker so the client is told "still waiting on you." If the
   Copilot CLI does not itself re-broadcast the pending elicitation on resume,
-  answering it delivers the human's decision to the resumed session as a normal
-  message (via `/elicit`'s fallback) so it is never silently dropped — worst
+  answering it validates the stored question ID and delivers the human's action
+  and optional content to the resumed session as a structured message. Delivery
+  is at-least-once across a crash, not an exactly-once effect guarantee — worst
   case the human answers once more.
 
 ## Deploy to Foundry

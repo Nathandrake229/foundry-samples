@@ -36,12 +36,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
+from dotenv import load_dotenv
+
+# Local modules construct environment-dependent snapshot/crash configuration at
+# import time, so load .env before importing them.
+load_dotenv(override=False)
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from dotenv import load_dotenv
 
 from azure.ai.agentserver.core.streaming import (
     EventStream,
@@ -52,15 +59,30 @@ from azure.ai.agentserver.core.tasks import set_resilient_tasks_enabled
 from azure.ai.agentserver.invocations import InvocationAgentServerHost
 
 try:
-    from .agent import copilot_agent, get_harness
+    from .agent import (
+        copilot_agent,
+        fail_harness_start,
+        mark_client_cancel,
+        reserve_harness,
+        submit_elicitation_decision,
+        submit_native_input,
+    )
     from .copilot_session import CopilotHarness
+    from .store import validate_session_id
 except ImportError:  # allow `python main.py` from inside this directory
-    from agent import copilot_agent, get_harness
+    from agent import (
+        copilot_agent,
+        fail_harness_start,
+        mark_client_cancel,
+        reserve_harness,
+        submit_elicitation_decision,
+        submit_native_input,
+    )
     from copilot_session import CopilotHarness
+    from store import validate_session_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-load_dotenv(override=False)
 
 # Per-turn streams persist to disk so they survive a container crash + restart.
 # cursor_fn reads the agent's sequence_number so ?last_event_id=N reconnects
@@ -75,7 +97,35 @@ set_resilient_tasks_enabled(True)
 
 
 def _task_id(session_id: str) -> str:
-    return f"copilot-{session_id}"
+    return f"copilot-{validate_session_id(session_id)}"
+
+
+_INPUT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_ELICITATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_input_id(value: Any) -> str:
+    input_id = str(value or uuid.uuid4())
+    if not _INPUT_ID_RE.fullmatch(input_id):
+        raise ValueError(
+            "input_id must be 1-128 ASCII letters, digits, underscores, or hyphens"
+        )
+    return input_id
+
+
+def _invalid_session_response(exc: ValueError) -> JSONResponse:
+    return JSONResponse(
+        {"error": "invalid_request", "message": str(exc)}, status_code=400
+    )
+
+
+def _validate_elicitation_id(value: Any) -> str:
+    elicitation_id = str(value)
+    if not _ELICITATION_ID_RE.fullmatch(elicitation_id):
+        raise ValueError(
+            "elicitation_id must be 1-128 ASCII letters, digits, underscores, or hyphens"
+        )
+    return elicitation_id
 
 
 def _session_id(request: Request) -> str:
@@ -145,35 +195,52 @@ async def handle_invoke(request: Request) -> Response:
         )
 
     invocation_id: str = request.state.invocation_id
-    session_id: str = request.state.session_id
-    task_id = _task_id(session_id)
+    try:
+        session_id = validate_session_id(str(request.state.session_id))
+        input_id = _validate_input_id(data.get("input_id"))
+        task_id = _task_id(session_id)
+    except ValueError as exc:
+        return _invalid_session_response(exc)
 
-    # If a turn is already live on this session, deliver the input straight to
-    # the Copilot session (steering / queueing) rather than starting a new task.
-    harness: CopilotHarness | None = get_harness(session_id)
-    if harness is not None:
-        await harness.send(prompt, mode=mode or "enqueue")
+    # The live task consumer durably journals the input before native Copilot
+    # delivery and acknowledges only after a live snapshot is saved.
+    try:
+        delivered = await submit_native_input(
+            session_id, input_id, prompt, mode or "enqueue"
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": "input_rejected", "message": str(exc)}, status_code=409
+        )
+    if delivered is not None:
         return JSONResponse(
             {
-                "status": "delivered",
+                **delivered,
                 "action": "steer" if mode == "immediate" else "queue",
                 "session_id": session_id,
             },
             status_code=202,
         )
 
-    # No live turn — reserve this turn's stream BEFORE starting the task so a
-    # late subscriber can still catch up from disk via ?last_event_id=N.
+    # No readied live harness (including closing/idle races): start or queue a
+    # framework-durable turn instead of touching a missing Copilot session.
     stream = await streams.get_or_create(invocation_id)
-    await copilot_agent.start(
-        task_id=task_id,
-        input={
-            "prompt": prompt,
-            "session_id": session_id,
-            "invocation_id": invocation_id,
-            "call_id": getattr(request.state, "call_id", None),
-        },
-    )
+    reserve_harness(session_id)
+    try:
+        await copilot_agent.start(
+            task_id=task_id,
+            input={
+                "prompt": prompt,
+                "session_id": session_id,
+                "invocation_id": invocation_id,
+                "call_id": getattr(request.state, "call_id", None),
+                "input_id": input_id,
+                "mode": mode,
+            },
+        )
+    except BaseException as exc:
+        fail_harness_start(session_id, exc)
+        raise
 
     if "text/event-stream" in request.headers.get("accept", ""):
         return StreamingResponse(
@@ -189,6 +256,7 @@ async def handle_invoke(request: Request) -> Response:
             "invocation_id": invocation_id,
             "session_id": session_id,
             "task_id": task_id,
+            "input_id": input_id,
         },
         status_code=202,
     )
@@ -227,6 +295,10 @@ async def handle_get(request: Request) -> Response:
             {"error": "Provide ?agent_session_id=<id> to locate the task."},
             status_code=404,
         )
+    try:
+        session_id = validate_session_id(session_id)
+    except ValueError as exc:
+        return _invalid_session_response(exc)
     from azure.ai.agentserver.core.tasks._manager import (
         get_task_manager,
     )  # noqa: PLC0415
@@ -269,6 +341,10 @@ async def handle_cancel(request: Request) -> Response:
                 "message": "Provide ?agent_session_id=<id>.",
             }
         )
+    try:
+        session_id = validate_session_id(session_id)
+    except ValueError as exc:
+        return _invalid_session_response(exc)
     from azure.ai.agentserver.core.tasks._manager import (
         get_task_manager,
     )  # noqa: PLC0415
@@ -281,6 +357,7 @@ async def handle_cancel(request: Request) -> Response:
                 "message": "No active task to cancel.",
             }
         )
+    mark_client_cancel(session_id)
     await run.cancel()
     return JSONResponse(
         {"status": "cancelled", "message": "Task cancellation requested."}
@@ -295,10 +372,12 @@ async def handle_elicit(request: Request) -> Response:
     """
     try:
         data = await request.json()
-        session_id = str(data["session_id"])
-        elicitation_id = str(data["elicitation_id"])
+        session_id = validate_session_id(str(data["session_id"]))
+        elicitation_id = _validate_elicitation_id(data["elicitation_id"])
         action = str(data.get("action", "accept"))
         content = data.get("content")
+    except ValueError as exc:
+        return _invalid_session_response(exc)
     except (json.JSONDecodeError, KeyError, TypeError):
         return JSONResponse(
             {
@@ -318,25 +397,29 @@ async def handle_elicit(request: Request) -> Response:
             },
             status_code=400,
         )
-
-    harness: CopilotHarness | None = get_harness(session_id)
-    if harness is not None and harness.answer_elicitation(
-        elicitation_id, action, content
-    ):
-        return JSONResponse({"status": "answered", "elicitation_id": elicitation_id})
-
-    # No live Future (e.g. the elicitation was raised before a crash). Deliver
-    # the human's decision to the resumed session as a normal message so it is
-    # not lost; the model continues with the answer in context.
-    if harness is not None and action == "accept" and content:
-        await harness.send(f"[human input] {json.dumps(content)}")
+    if content is not None and not isinstance(content, dict):
         return JSONResponse(
-            {"status": "delivered_as_message", "elicitation_id": elicitation_id}
+            {
+                "error": "invalid_request",
+                "message": "content must be a JSON object when provided.",
+            },
+            status_code=400,
         )
+
+    try:
+        result = await submit_elicitation_decision(
+            session_id, elicitation_id, action, content
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": "invalid_request", "message": str(exc)}, status_code=409
+        )
+    if result is not None:
+        return JSONResponse(result)
     return JSONResponse(
         {
             "status": "no_pending_elicitation",
-            "message": "No live elicitation and nothing to deliver; the turn may have ended.",
+            "message": "No active durable task is accepting this elicitation decision.",
         },
         status_code=409,
     )

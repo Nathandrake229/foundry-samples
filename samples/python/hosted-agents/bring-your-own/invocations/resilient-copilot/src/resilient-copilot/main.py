@@ -376,7 +376,7 @@ async def handle_elicit(request: Request) -> Response:
     """
     try:
         data = await request.json()
-        session_id = validate_session_id(str(data["session_id"]))
+        session_id = validate_session_id(data["session_id"])
         elicitation_id = _validate_elicitation_id(data["elicitation_id"])
         action = str(data.get("action", "accept"))
         content = data.get("content")

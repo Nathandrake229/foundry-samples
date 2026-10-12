@@ -1563,6 +1563,41 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
             str(generated),
         )
 
+    async def test_elicitation_rejects_non_string_session_ids_without_routing(self):
+        with patch.object(main, "submit_elicitation_decision", AsyncMock()) as submit:
+            for value in (None, 123, False, ["session"], {"session": "id"}):
+                with self.subTest(value=value):
+                    response = await main.handle_elicit(
+                        self.request(
+                            {
+                                "session_id": value,
+                                "elicitation_id": "question",
+                                "action": "accept",
+                            }
+                        )
+                    )
+                    self.assertEqual(response.status_code, 400)
+            submit.assert_not_awaited()
+
+    async def test_elicitation_preserves_literal_valid_string_session_ids(self):
+        for session_id in ("session", "None", "123"):
+            with self.subTest(session_id=session_id), patch.object(
+                main,
+                "submit_elicitation_decision",
+                AsyncMock(return_value={"status": "answered"}),
+            ) as submit:
+                response = await main.handle_elicit(
+                    self.request(
+                        {
+                            "session_id": session_id,
+                            "elicitation_id": "question",
+                            "action": "accept",
+                        }
+                    )
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(submit.await_args.args[0], session_id)
+
     async def test_non_string_elicitation_ids_are_rejected(self):
         with patch.object(main, "submit_elicitation_decision", AsyncMock()) as submit:
             for value in (None, 0, False):

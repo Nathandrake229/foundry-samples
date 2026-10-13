@@ -766,7 +766,7 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
         harness.stop_accepting_controls()
         await harness.abort()
         await harness.close()
-        await save_snapshot(live=False)
+        await save_snapshot(live=True)
 
         if shutting_down:
             return await ctx.exit_for_recovery()

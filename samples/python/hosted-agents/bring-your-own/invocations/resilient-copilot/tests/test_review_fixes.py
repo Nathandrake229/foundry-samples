@@ -46,6 +46,7 @@ from store import (
     _pack_dir,
     _unpack_dir,
     session_storage_key,
+    todo_fingerprint,
     validate_session_id,
 )
 import main
@@ -56,6 +57,27 @@ class SnapshotSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+
+    def test_fingerprint_rejects_core_links_before_any_target_read(self):
+        for name in ("session.db", "plan.md"):
+            with self.subTest(name=name):
+                workspace = self.root / name.replace(".", "-")
+                workspace.mkdir()
+                linked = workspace / name
+                with patch.object(
+                    Path,
+                    "is_symlink",
+                    autospec=True,
+                    side_effect=lambda path: path == linked,
+                ), patch.object(
+                    snapshot_module.sqlite3, "connect"
+                ) as connect, patch.object(
+                    Path, "read_bytes", autospec=True
+                ) as read:
+                    with self.assertRaisesRegex(ValueError, "regular file"):
+                        todo_fingerprint(workspace)
+                connect.assert_not_called()
+                read.assert_not_called()
 
     def test_session_ids_are_validated_and_filesystem_keys_are_hashed(self):
         valid = "A_b-9" * 20
@@ -1300,8 +1322,41 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             sqlite3.connect(workspace / "session.db").close()
             await harness.queue.put(None)
             await task
-            snapshot.save.assert_awaited_once_with("session", config_dir, live=False)
+            snapshot.save.assert_awaited_once_with("session", config_dir, live=True)
             self.assertTrue(state_store.value["has_snapshot"])
+
+    async def test_final_checkpoint_preserves_committed_wal_with_a_writer_remaining(
+        self,
+    ):
+        config = self.root / "config" / session_storage_key("session")
+        workspace = config / "session-state" / "session"
+        workspace.mkdir(parents=True)
+        root_db = sqlite3.connect(config / "session-store.db")
+        root_db.execute("CREATE TABLE sessions (id TEXT)")
+        root_db.commit()
+        root_db.close()
+        writer = sqlite3.connect(workspace / "session.db")
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("CREATE TABLE proof (value TEXT)")
+        writer.execute("INSERT INTO proof VALUES ('committed-in-wal')")
+        writer.commit()
+        self.assertTrue((workspace / "session.db-wal").exists())
+        snapshots = SessionSnapshotStore(self.root / "final-snapshots")
+        snapshots._use_state_store = False
+
+        _, _, _, snapshot = await self.run_task(snapshot_side_effect=snapshots.save)
+        snapshot.save.assert_awaited_once_with("session", config, live=True)
+        restored = self.root / "restored-final"
+        self.assertTrue(await snapshots.restore("session", restored))
+        restored_db = sqlite3.connect(
+            restored / "session-state" / "session" / "session.db"
+        )
+        self.addCleanup(restored_db.close)
+        self.assertEqual(
+            restored_db.execute("SELECT value FROM proof").fetchall(),
+            [("committed-in-wal",)],
+        )
 
     async def test_crash_before_first_database_keeps_journal_without_snapshot_promise(
         self,

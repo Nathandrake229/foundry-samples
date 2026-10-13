@@ -209,6 +209,8 @@ def todo_fingerprint(workspace: Path) -> str | None:
     """Identify committed todo/dependency rows and the session's plan file."""
     state: dict[str, Any] = {}
     db_path = workspace / "session.db"
+    if db_path.is_symlink():
+        raise ValueError("session.db must be a regular file")
     if db_path.exists():
         with closing(
             sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=5)
@@ -228,6 +230,8 @@ def todo_fingerprint(workspace: Path) -> str | None:
                     )
                     state[table] = {"columns": columns, "rows": rows}
     plan = workspace / "plan.md"
+    if plan.is_symlink():
+        raise ValueError("plan.md must be a regular file")
     if plan.exists():
         state["plan"] = hashlib.sha256(plan.read_bytes()).hexdigest()
     required_paths = _load_required_paths(workspace)

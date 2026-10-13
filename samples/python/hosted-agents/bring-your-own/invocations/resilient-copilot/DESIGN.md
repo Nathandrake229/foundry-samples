@@ -85,6 +85,8 @@ consumer even when the SDK suppresses the hook exception.
 Live snapshots use SQLite's online backup API, rather than copying active DB
 and WAL files. Database sidecars and process lock files are excluded from live
 archives, and incomplete JSONL tails are omitted.
+The final checkpoint uses the same live-safe path; requesting CLI shutdown
+does not prove that every writer actually stopped.
 
 Only the known CLI recovery files and declared required workspace files are
 stored. The declaration is

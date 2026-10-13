@@ -164,6 +164,12 @@ recovery to find unfinished controls. A crash between delivery and its durable
 receipt can require replay; this is at-least-once processing, not an exactly-once
 message or effect guarantee.
 
+Initial input IDs are reserved before harness readiness. Before the CLI creates
+its workspace database, persist the delivery receipt in the journal without
+claiming a snapshot. Post-tool/final checkpoints still require the recovery
+databases. Once a snapshot exists, a missing required database is an error,
+not another startup deferral.
+
 Callers may supply a stable `input_id` for native follow-up retries. Conflicting
 content for the same ID is rejected before checking its delivery status.
 An absent ID is generated; an explicitly invalid value is rejected.

@@ -117,6 +117,11 @@ while the original input is still accepted but not delivered. The unfinished-inp
 journal is bounded to 32 entries and 512 KiB of JSON; wait for work to finish before
 submitting more when that bound is reached.
 
+The initial input is journaled before the harness becomes ready. Copilot creates
+its workspace database lazily, so an early delivery receipt is not a session
+snapshot. The first tool/final checkpoint saves the required files once present;
+a crash before that checkpoint replays the durable input, not live memory.
+
 While the harness is ready, `immediate` and `enqueue` use Copilot's native
 controls. During startup, follow-ups wait for readiness. A request arriving
 after the harness enters closing becomes a durable next turn; it cannot

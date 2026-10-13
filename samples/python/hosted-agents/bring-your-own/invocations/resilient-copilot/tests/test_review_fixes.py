@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -1096,6 +1097,11 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.sleep(0)
             self.assertFalse(submit.done())
+            config_dir = self.root / "config" / session_storage_key("session")
+            workspace = config_dir / "session-state" / "session"
+            workspace.mkdir(parents=True)
+            sqlite3.connect(config_dir / "session-store.db").close()
+            sqlite3.connect(workspace / "session.db").close()
             QueueHarness.start_gate.set()
             result = await asyncio.wait_for(submit, 2)
             self.assertEqual(result["status"], "delivered")
@@ -1188,6 +1194,8 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             )
             harness = QueueHarness.instances[-1]
             self.assertEqual(harness.sent, [("initial prompt", "immediate")])
+            snapshot.save.assert_not_awaited()
+            self.assertNotIn("has_snapshot", state_store.value)
             after_receipt = await agent.submit_native_input(
                 "session", "initial-id", "initial prompt", "immediate"
             )
@@ -1213,8 +1221,213 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                 "immediate",
             )
             self.assertEqual(harness.sent, [("initial prompt", "immediate")])
+            early_followup = await agent.submit_native_input(
+                "session", "early-followup", "follow up", "enqueue"
+            )
+            self.assertEqual(early_followup["status"], "delivered")
+            self.assertEqual(
+                harness.sent,
+                [
+                    ("initial prompt", "immediate"),
+                    ("follow up", "enqueue"),
+                ],
+            )
+            snapshot.save.assert_not_awaited()
+            self.assertNotIn("has_snapshot", state_store.value)
+
+            config_dir = Path(harness.start.call_args.kwargs["config_directory"])
+            workspace = config_dir / "session-state" / "session"
+            workspace.mkdir(parents=True)
+            sqlite3.connect(config_dir / "session-store.db").close()
+            sqlite3.connect(workspace / "session.db").close()
+            checkpoint_ack = asyncio.get_running_loop().create_future()
+            await harness.queue.put(
+                TodoCheckpointRequest("startup-ready", checkpoint_ack)
+            )
+            await asyncio.wait_for(checkpoint_ack, 2)
+            self.assertTrue(state_store.value["has_snapshot"])
+            self.assertEqual(snapshot.save.await_count, 1)
             await harness.queue.put(None)
             await task
+            self.assertEqual(snapshot.save.await_count, 2)
+
+    async def test_initial_delivery_uses_only_final_snapshot_after_late_db_creation(
+        self,
+    ):
+        QueueHarness.start_gate = asyncio.Event()
+        state_store = FakeStateStore({})
+        snapshot = SimpleNamespace(
+            restore=AsyncMock(return_value=False),
+            save=AsyncMock(),
+        )
+        stream = FakeStream()
+        context = self.context(
+            native_input_id="initial-id",
+            prompt="initial prompt",
+            mode="enqueue",
+        )
+        with patch.object(
+            agent, "_CONFIG_ROOT", self.root / "config-final-only"
+        ), patch.object(agent, "_SNAPSHOT_STORE", snapshot), patch.object(
+            agent, "CopilotHarness", QueueHarness
+        ), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ), patch.object(
+            agent, "_get_legacy_state_item", AsyncMock(return_value=None)
+        ):
+            task = asyncio.create_task(agent.copilot_agent._fn(context))
+            while "input_journal" not in (state_store.value or {}):
+                await asyncio.sleep(0)
+            retry = asyncio.create_task(
+                agent.submit_native_input(
+                    "session", "initial-id", "initial prompt", "enqueue"
+                )
+            )
+            QueueHarness.start_gate.set()
+            self.assertTrue((await asyncio.wait_for(retry, 2))["deduplicated"])
+            harness = QueueHarness.instances[-1]
+            snapshot.save.assert_not_awaited()
+            self.assertNotIn("has_snapshot", state_store.value)
+
+            config_dir = Path(harness.start.call_args.kwargs["config_directory"])
+            workspace = config_dir / "session-state" / "session"
+            workspace.mkdir(parents=True)
+            sqlite3.connect(config_dir / "session-store.db").close()
+            sqlite3.connect(workspace / "session.db").close()
+            await harness.queue.put(None)
+            await task
+            snapshot.save.assert_awaited_once_with("session", config_dir, live=False)
+            self.assertTrue(state_store.value["has_snapshot"])
+
+    async def test_crash_before_first_database_keeps_journal_without_snapshot_promise(
+        self,
+    ):
+        QueueHarness.start_gate = asyncio.Event()
+        state_store = FakeStateStore({})
+        snapshot = SimpleNamespace(
+            restore=AsyncMock(return_value=False),
+            save=AsyncMock(),
+        )
+        stream = FakeStream()
+        context = self.context(
+            native_input_id="initial-id",
+            prompt="initial prompt",
+            mode="enqueue",
+        )
+        with patch.object(
+            agent, "_CONFIG_ROOT", self.root / "config-crash-before-db"
+        ), patch.object(agent, "_SNAPSHOT_STORE", snapshot), patch.object(
+            agent, "CopilotHarness", QueueHarness
+        ), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ), patch.object(
+            agent, "_get_legacy_state_item", AsyncMock(return_value=None)
+        ):
+            task = asyncio.create_task(agent.copilot_agent._fn(context))
+            QueueHarness.start_gate.set()
+            while not QueueHarness.instances:
+                await asyncio.sleep(0)
+            harness = QueueHarness.instances[-1]
+            while (
+                len(harness.sent) != 1
+                or state_store.value["input_journal"][0]["status"] != "delivered"
+            ):
+                await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            snapshot.save.assert_not_awaited()
+            self.assertNotIn("has_snapshot", state_store.value)
+            self.assertEqual(
+                state_store.value["input_journal"][0]["status"], "delivered"
+            )
+
+        recovery_state = copy.deepcopy(state_store.value)
+        ImmediateHarness.instances.clear()
+        await self.run_task(
+            context=self.context(
+                entry_mode="recovered",
+                native_input_id="initial-id",
+                prompt="initial prompt",
+                mode="enqueue",
+            ),
+            state=recovery_state,
+            restore=False,
+        )
+        recovered_harness = ImmediateHarness.instances[-1]
+        self.assertFalse(recovered_harness.start.call_args.kwargs["recover"])
+        self.assertEqual(
+            recovered_harness.sent,
+            [("initial prompt", "enqueue")],
+        )
+
+    async def test_promised_snapshot_missing_db_fails_delivery_without_new_receipt(
+        self,
+    ):
+        config_root = self.root / "config-promised-strict"
+        config_dir = config_root / session_storage_key("session")
+        config_dir.mkdir(parents=True)
+        (config_dir / "session-store.db").write_bytes(b"local-root-db")
+
+        snapshot = SessionSnapshotStore(self.root / "strict-snapshots")
+        snapshot._use_state_store = False
+        previous_source = self.root / "previous-source"
+        previous_source.mkdir()
+        (previous_source / "session-store.db").write_bytes(b"previous")
+        previous_blob = _pack_dir(previous_source)
+        snapshot._path("session").write_bytes(previous_blob)
+
+        record = {
+            "input_id": "initial-id",
+            "prompt": "initial prompt",
+            "mode": "enqueue",
+            "status": "accepted",
+        }
+        state_store = FakeStateStore(
+            {
+                "has_snapshot": True,
+                "input_journal": [record],
+            }
+        )
+        stream = FakeStream()
+        with patch.object(agent, "_CONFIG_ROOT", config_root), patch.object(
+            agent, "_SNAPSHOT_STORE", snapshot
+        ), patch.object(agent, "CopilotHarness", ImmediateHarness), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ), patch.object(
+            agent, "_get_legacy_state_item", AsyncMock(return_value=None)
+        ):
+            with self.assertRaisesRegex(
+                FileNotFoundError, "required Copilot recovery database"
+            ):
+                await agent.copilot_agent._fn(
+                    self.context(
+                        native_input_id="initial-id",
+                        prompt="initial prompt",
+                        mode="enqueue",
+                    )
+                )
+
+        self.assertEqual(snapshot._path("session").read_bytes(), previous_blob)
+        persisted = state_store.value["input_journal"][0]
+        self.assertEqual(persisted["status"], "accepted")
+        self.assertNotIn("receipt", persisted)
+        self.assertEqual(
+            [frame["type"] for frame in stream.frames],
+            ["turn_start", "turn_failed"],
+        )
 
     async def test_idle_queued_during_acceptance_does_not_cover_native_input(self):
         harness = CopilotHarness()
@@ -1500,11 +1713,13 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         }
 
         async def restore(_session_id, config_dir):
-            config_dir.mkdir(parents=True)
+            workspace = config_dir / "session-state" / "session"
+            workspace.mkdir(parents=True)
             (config_dir / "session-store.db").write_bytes(b"db")
+            (workspace / "session.db").write_bytes(b"db")
             return True
 
-        _, _, _, _ = await self.run_task(
+        _, _, _, snapshot = await self.run_task(
             context=self.context(
                 entry_mode="recovered",
                 native_input_id="accepted",
@@ -1516,6 +1731,7 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         harness = ImmediateHarness.instances[-1]
         self.assertEqual(harness.sent, [("accepted prompt", "enqueue")])
+        self.assertEqual(snapshot.save.await_count, 2)
 
     async def test_recovery_replays_initial_record_only_once_for_each_status(self):
         for status in ("accepted", "delivered"):
@@ -1536,11 +1752,13 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                 state = {"input_journal": [record]}
 
                 async def restore(_session_id, config_dir):
-                    config_dir.mkdir(parents=True)
+                    workspace = config_dir / "session-state" / "session"
+                    workspace.mkdir(parents=True)
                     (config_dir / "session-store.db").write_bytes(b"db")
+                    (workspace / "session.db").write_bytes(b"db")
                     return True
 
-                await self.run_task(
+                _, _, _, snapshot = await self.run_task(
                     context=self.context(
                         entry_mode="recovered",
                         native_input_id="initial-id",
@@ -1554,6 +1772,7 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                     ImmediateHarness.instances[-1].sent,
                     [("initial prompt", "enqueue")],
                 )
+                self.assertEqual(snapshot.save.await_count, 2)
 
     async def test_existing_accepted_input_rejects_prompt_and_mode_conflicts(self):
         state = {

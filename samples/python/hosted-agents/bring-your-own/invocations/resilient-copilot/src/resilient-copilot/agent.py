@@ -397,6 +397,28 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
             state["has_snapshot"] = True
             await persist_state()
 
+        def snapshot_ready() -> bool:
+            return (config_dir / "session-store.db").is_file() and (
+                config_dir / "session-state" / session_id / "session.db"
+            ).is_file()
+
+        async def persist_input_delivery(record: dict[str, Any]) -> None:
+            if state.get("has_snapshot") or snapshot_ready():
+                await save_snapshot(live=True)
+            else:
+                logger.info(
+                    "copilot_input_delivered_before_snapshot_ready "
+                    "session=%s input_id=%s",
+                    session_id,
+                    record["input_id"],
+                )
+            record["status"] = "delivered"
+            record["receipt"] = {
+                "status": "delivered",
+                "input_id": record["input_id"],
+            }
+            await persist_state()
+
         async def process_elicitation_request(request: ElicitationRequest) -> None:
             try:
                 markers = _elicitations(state)
@@ -496,13 +518,7 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                         mode=record["mode"],
                         causal_idle=True,
                     )
-                    await save_snapshot(live=True)
-                    record["status"] = "delivered"
-                    record["receipt"] = {
-                        "status": "delivered",
-                        "input_id": request.input_id,
-                    }
-                    await persist_state()
+                    await persist_input_delivery(record)
                     result = {
                         **record["receipt"],
                         "deduplicated": False,
@@ -670,13 +686,7 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     mode=record["mode"],
                     causal_idle=True,
                 )
-                await save_snapshot(live=True)
-                record["status"] = "delivered"
-                record["receipt"] = {
-                    "status": "delivered",
-                    "input_id": record["input_id"],
-                }
-                await persist_state()
+                await persist_input_delivery(record)
 
         for marker in list(_elicitations(state).values()):
             decision = marker.get("decision")

@@ -268,6 +268,25 @@ def _decision_message(elicitation_id: str, action: str, content: dict | None) ->
     return f"[human elicitation response] {json.dumps(payload, sort_keys=True)}"
 
 
+def _same_elicitation_decision(
+    existing: dict[str, Any], requested: dict[str, Any]
+) -> bool:
+    """Compare decisions using canonical JSON so bools remain distinct from numbers."""
+    return json.dumps(
+        existing,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ) == json.dumps(
+        requested,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
 @multi_turn_task(name="copilot_agent", steerable=True)
 async def copilot_agent(ctx: TaskContext[dict]) -> None:
     """Supervise one Copilot turn and durably serialize native controls."""
@@ -480,23 +499,47 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     if not request.acknowledged.done():
                         request.acknowledged.set_exception(error)
                     return
-                marker["decision"] = {
+                requested_decision = {
                     "action": request.action,
                     "content": request.content,
                 }
+                existing_decision = marker.get("decision")
+                if existing_decision is not None:
+                    if not _same_elicitation_decision(
+                        existing_decision, requested_decision
+                    ):
+                        error = ValueError(
+                            "elicitation decision is already bound to different "
+                            "action or content"
+                        )
+                        if not request.acknowledged.done():
+                            request.acknowledged.set_exception(error)
+                        return
+                    if marker.get("delivery") == "submitted":
+                        receipt = marker.get("receipt")
+                        if not isinstance(receipt, dict):
+                            receipt = {
+                                "status": "answered",
+                                "elicitation_id": request.elicitation_id,
+                            }
+                        if not request.acknowledged.done():
+                            request.acknowledged.set_result(dict(receipt))
+                        return
+                marker["decision"] = requested_decision
                 marker["delivery"] = "accepted"
                 _sync_pending_elicitation(state)
                 await persist_state()
                 delivery = await deliver_elicitation_decision(
                     request.elicitation_id, request.action, request.content
                 )
+                receipt = {
+                    "status": delivery,
+                    "elicitation_id": request.elicitation_id,
+                }
+                marker["receipt"] = receipt
+                await persist_state()
                 if not request.acknowledged.done():
-                    request.acknowledged.set_result(
-                        {
-                            "status": delivery,
-                            "elicitation_id": request.elicitation_id,
-                        }
-                    )
+                    request.acknowledged.set_result(dict(receipt))
             except BaseException as exc:
                 if not request.acknowledged.done():
                     request.acknowledged.set_exception(exc)

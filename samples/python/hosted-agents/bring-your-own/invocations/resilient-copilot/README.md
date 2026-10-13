@@ -26,7 +26,7 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 |---|---|---|
 | **Long-running / no-ingress survival** | Work keeps running past idle-eviction even with no client connected. | While the Copilot agent grinds through a (possibly minutes-long) tool loop, the task is `in_progress`, so the platform keeps the container alive. |
 | **Crash recovery** | A replacement container restores the latest saved Copilot session. | On recovered entry, the task restores the session snapshot from `FoundryStateStore` before calling `resume_session(session_id)` and re-driving the prompt. Uncheckpointed work can repeat. |
-| **Todo/plan checkpoints** | Todo progress is saved during a turn, not just at its end. | After a tool changes todo rows, dependencies or `plan.md`, a post-tool hook waits for a live session snapshot. The stream emits `todo_checkpoint` after persistence succeeds. |
+| **Continuation checkpoints** | Todo, plan and declared required-file changes are saved within a turn. | A post-tool hook waits for the required-only session snapshot; the stream emits `todo_checkpoint` only after persistence succeeds. |
 | **Steering** | A new input redirects the in-flight turn instead of racing it. | Accepted inputs are persisted before HTTP acknowledgement and delivered through Copilot's native `send(mode="immediate")`. Interrupted delivery can replay. |
 | **Queueing** | A follow-up input runs after the current turn. | Durable acceptance and native `send(mode="enqueue")` preserve follow-ups; recovery is at-least-once, not exactly-once delivery. |
 | **Streaming with reconnect** | Clients reconnect after a drop or crash with no gap. | Every Copilot `SessionEvent` is emitted onto a **file-backed** replay stream with a monotonic `sequence_number`; reconnect via `GET … ?last_event_id=N`. |
@@ -180,11 +180,13 @@ pre-crash events + `recovered` + the continuation.
 
 Multiple todos can complete in one Copilot turn. Completing a todo does not
 end the turn or create another Foundry task. This sample preserves that behavior
-and saves the session after each detected todo/plan change.
+and saves the session after each detected todo/plan or declared required-file
+change.
 
 The pinned CLI stores todos in the session workspace's `session.db`. The
-post-tool hook compares the `todos` and `todo_deps` rows and `plan.md` with the
-last acknowledged state. Read-only queries do not create another snapshot.
+post-tool hook compares the `todos` and `todo_deps` rows, `plan.md`, and declared
+required files with the last acknowledged state. Read-only queries do not
+create another snapshot.
 The task handles the checkpoint in its own request context and acknowledges the
 hook only after saving the snapshot and marker. Detection and persistence
 failures reach the task consumer and fail the turn rather than claiming
@@ -194,26 +196,61 @@ Live snapshots use SQLite's online backup API, so committed todo rows in an
 active WAL are included without copying active database sidecars. An incomplete
 JSONL tail is omitted. Symbolic links are excluded before any file is read,
 so they cannot add out-of-tree data or unrestorable link members.
-Each database is consistent independently; this is not
-an atomic snapshot across all files or an exactly-once guarantee for tool effects.
+Each database is consistent independently; this is not an atomic snapshot
+across all files or an exactly-once guarantee for tool effects.
 Recovery re-drives the prompt with the saved plan, rather than resuming a live
 instruction pointer.
 
-The archive covers the per-session Copilot configuration/workspace directory,
-not the entire container filesystem. Files under `/tmp` or another working
-directory do not survive replacement through this snapshot. Keep recoverable
-artifacts inside the snapshotted workspace or use separate durable storage.
+### Required-only session snapshot
 
-The latest snapshot is also saved after the client closes. In hosted execution
-it is a State Store item; offline execution uses a local archive. The default
-snapshot retention is 30 days from its latest write, separate from task
-retention.
+The sample keeps one archive per session in `copilot-session-snapshots-v2`.
+New snapshots contain only the core CLI files needed for continuation:
 
-New writes use the versioned 30-day snapshot store. Recovery can still read
-legacy snapshots while their original retention permits it; a previously
-expired snapshot cannot be recovered by extending the new store's lifetime.
+- `session-store.db` and `session-state/<session_id>/session.db`, including
+  todo/dependency state.
+- The session's `events.jsonl`, `workspace.yaml`, `checkpoints/index.md` and
+  `plan.md`, when present.
+- The required-file declaration and files it explicitly selects, when present.
 
-The serialized snapshot value is bounded at 5 MiB, including base64 overhead.
+Optional generated outputs, caches, downloads and diagnostic logs remain on
+the runtime filesystem. They are not promised to survive container replacement.
+No persistent disk or extra storage resource is provisioned by this sample.
+Copilot's `events.jsonl` is recovery history, not an optional diagnostic log.
+
+To preserve an artifact, create
+`session-state/<session_id>/continuation-files.json` under that session's
+Copilot configuration directory:
+
+```json
+{
+  "schema": "copilot-continuation-files/v1",
+  "paths": ["artifacts/continuation.txt", "outputs/approved-state.json"]
+}
+```
+
+Paths refer to regular files inside `session-state/<session_id>`, use `/`
+separators and cannot be absolute, duplicated, traversal paths or symlinks.
+Missing/invalid declared files fail the checkpoint. A file's location or
+extension alone does not make it required. Tell the agent to create this
+declaration when unfinished work depends on generated files. Files outside
+the session workspace, including `/tmp`, need separate durable storage.
+Removing a declaration deliberately removes those artifacts from future
+snapshots. Registered executable files retain their permissions.
+
+The selected files are packed into one archive and written as one State Store
+value. Packing/validation failures happen before that write, leaving the
+previous snapshot intact. No cross-store manifest or category protocol is
+needed.
+
+The latest checkpoint is also saved at the turn boundary. Hosted writes use
+platform State Store; offline mode atomically replaces a local archive.
+Retention is 30 days from the last snapshot write, separate from task retention.
+Existing v2 and legacy v1 archives remain readable, including their previously
+saved artifacts. The next new snapshot applies the required-only selection.
+Expired legacy data cannot be recovered by changing the newer store's TTL.
+
+The serialized snapshot value is bounded at 5 MiB, including base64 and JSON
+overhead. The task attachment API's 10 MiB limit is a different limit.
 Values above 1 MiB require the service's managed value offload; that path stores
 the value through Dataset-backed blob storage and hydrates it on reads. With
 offload disabled, the service can reject values above 1 MiB. No additional

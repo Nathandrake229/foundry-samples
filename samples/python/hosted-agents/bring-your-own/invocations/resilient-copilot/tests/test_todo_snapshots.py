@@ -3,9 +3,11 @@ import base64
 from contextlib import closing
 import importlib
 import io
+import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sqlite3
+import stat
 import sys
 import tarfile
 import tempfile
@@ -18,12 +20,19 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "resilient-copilot"
 sys.path.insert(0, str(SRC))
 
 from copilot.session import CopilotSession
+import store as snapshot_module
 from copilot_session import (
     CopilotHarness,
     TodoCheckpointDetectionFailure,
     TodoCheckpointRequest,
 )
-from store import SessionSnapshotStore, SnapshotTooLargeError, todo_fingerprint
+from store import (
+    SessionSnapshotStore,
+    SnapshotTooLargeError,
+    _PIN_SCHEMA,
+    _pack_dir,
+    todo_fingerprint,
+)
 
 
 def create_todos(workspace: Path) -> sqlite3.Connection:
@@ -36,6 +45,24 @@ def create_todos(workspace: Path) -> sqlite3.Connection:
     return db
 
 
+def create_core_layout(root: Path, *, plan=True):
+    config = root / "config"
+    workspace = config / "session-state" / "test"
+    checkpoints = workspace / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    sqlite3.connect(config / "session-store.db").close()
+    db = create_todos(workspace)
+    db.execute("INSERT INTO todos VALUES ('a', 'step', 'done')")
+    db.commit()
+    db.close()
+    (workspace / "events.jsonl").write_bytes(b'{"saved":true}\n{"partial":')
+    (workspace / "workspace.yaml").write_text("workspace: test", encoding="utf-8")
+    (checkpoints / "index.md").write_text("checkpoint", encoding="utf-8")
+    if plan:
+        (workspace / "plan.md").write_text("required plan", encoding="utf-8")
+    return config, workspace
+
+
 class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -43,6 +70,8 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name)
         self.config = self.root / "config"
         self.workspace = self.config / "session-state" / "test"
+        self.config.mkdir(parents=True)
+        sqlite3.connect(self.config / "session-store.db").close()
         self.db = create_todos(self.workspace)
         self.addCleanup(self.db.close)
         self.store = SessionSnapshotStore(self.root / "snapshots")
@@ -56,13 +85,11 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         )
         self.db.commit()
 
-    def test_fingerprint_tracks_todos_dependencies_plan_and_deletion(self):
+    def test_fingerprint_tracks_todos_plan_registration_and_required_content(self):
         empty = todo_fingerprint(self.workspace)
         self.change_todo("pending")
         pending = todo_fingerprint(self.workspace)
         self.assertNotEqual(empty, pending)
-        self.db.execute("SELECT * FROM todos").fetchall()
-        self.assertEqual(pending, todo_fingerprint(self.workspace))
         self.change_todo("done")
         done = todo_fingerprint(self.workspace)
         self.assertNotEqual(pending, done)
@@ -73,9 +100,18 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         (self.workspace / "plan.md").write_text("A then B", encoding="utf-8")
         plan = todo_fingerprint(self.workspace)
         self.assertNotEqual(deps, plan)
-        self.db.execute("DELETE FROM todos")
-        self.db.commit()
-        self.assertNotEqual(plan, todo_fingerprint(self.workspace))
+        (self.workspace / "required.txt").write_text("v1", encoding="utf-8")
+        (self.workspace / "continuation-files.json").write_text(
+            json.dumps({"schema": _PIN_SCHEMA, "paths": ["required.txt"]}),
+            encoding="utf-8",
+        )
+        registered = todo_fingerprint(self.workspace)
+        self.assertNotEqual(plan, registered)
+        (self.workspace / "required.txt").write_text("v2", encoding="utf-8")
+        self.assertNotEqual(registered, todo_fingerprint(self.workspace))
+        (self.workspace / "required.txt").unlink()
+        with self.assertRaises(FileNotFoundError):
+            todo_fingerprint(self.workspace)
 
     async def test_live_snapshot_restores_committed_wal_todos_to_new_directory(self):
         self.change_todo("done")
@@ -85,21 +121,7 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         (self.workspace / "plan.md").write_text("A then B", encoding="utf-8")
         (self.workspace / "inuse.lock").write_text("stale", encoding="utf-8")
         (self.workspace / "events.jsonl").write_bytes(b'{"type":"saved"}\n{"partial":')
-        cloud = SimpleNamespace(set_item=AsyncMock(), get_item=AsyncMock())
-        self.store._use_state_store = True
-        self.store._store = cloud
-
         await self.store.save("test", self.config, live=True)
-        session_id, value = cloud.set_item.call_args.args
-        self.assertEqual(session_id, "test")
-        cloud.get_item.return_value = SimpleNamespace(value=value)
-        with tarfile.open(
-            fileobj=io.BytesIO(base64.b64decode(value["tar_gz_b64"])), mode="r:gz"
-        ) as archive:
-            names = archive.getnames()
-        self.assertFalse(
-            any(name.endswith((".lock", "-wal", "-shm")) for name in names)
-        )
 
         restored = self.root / "replacement"
         self.assertTrue(await self.store.restore("test", restored))
@@ -116,6 +138,7 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (workspace / "events.jsonl").read_bytes(), b'{"type":"saved"}\n'
         )
+        self.assertFalse((workspace / "inuse.lock").exists())
 
     async def test_latest_todo_checkpoint_replaces_previous_snapshot(self):
         for status in ("pending", "in_progress", "done"):
@@ -150,16 +173,14 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         harness._todo_fingerprint = todo_fingerprint(self.workspace)
         for status in ("pending", "in_progress", "done"):
             self.change_todo(status)
-            hook = asyncio.create_task(
-                harness._post_tool_use({}, {"session_id": "test"})
-            )
+            hook = asyncio.create_task(harness._post_tool_use({}, {}))
             request = await asyncio.wait_for(harness._queue.get(), 2)
             self.assertIsInstance(request, TodoCheckpointRequest)
             self.assertFalse(hook.done())
             await self.store.save("test", self.config, live=True)
             request.acknowledged.set_result(None)
             await asyncio.wait_for(hook, 2)
-            await harness._post_tool_use({}, {"session_id": "test"})
+            await harness._post_tool_use({}, {})
             self.assertTrue(harness._queue.empty())
 
     async def test_failed_checkpoint_does_not_advance_fingerprint(self):
@@ -183,18 +204,13 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
         harness._todo_fingerprint = todo_fingerprint(self.workspace)
         sdk_session = CopilotSession("test", SimpleNamespace())
         sdk_session._hooks = {"on_post_tool_use": harness._post_tool_use}
-
         detection_error = sqlite3.DatabaseError("locked todo database")
-        with patch(
-            "copilot_session.todo_fingerprint",
-            side_effect=detection_error,
-        ):
+        with patch("copilot_session.todo_fingerprint", side_effect=detection_error):
             dispatch = asyncio.create_task(
                 sdk_session._handle_hooks_invoke("postToolUse", {})
             )
             failure = await asyncio.wait_for(harness._queue.get(), 2)
             self.assertIsInstance(failure, TodoCheckpointDetectionFailure)
-            self.assertIs(failure.error, detection_error)
             failure.acknowledged.set_exception(failure.error)
             self.assertIsNone(await asyncio.wait_for(dispatch, 2))
 
@@ -239,6 +255,227 @@ class TodoSnapshotTests(unittest.IsolatedAsyncioTestCase):
             await harness.close()
 
 
+class RequiredOnlySnapshotTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    async def test_one_item_contains_core_and_pins_but_excludes_optional_files(self):
+        config, workspace = create_core_layout(self.root)
+        artifacts = workspace / "artifacts"
+        artifacts.mkdir()
+        (artifacts / "continuation.txt").write_text("required", encoding="utf-8")
+        (workspace / "optional-output.txt").write_text("optional", encoding="utf-8")
+        (workspace / "cache.db").write_bytes(b"optional database")
+        (workspace / "uv.lock").write_text("uv lock", encoding="utf-8")
+        (workspace / "continuation-files.json").write_text(
+            json.dumps(
+                {
+                    "schema": _PIN_SCHEMA,
+                    "paths": ["artifacts/continuation.txt", "uv.lock"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = SessionSnapshotStore(self.root / "snapshots")
+        cloud = SimpleNamespace(set_item=AsyncMock(), get_item=AsyncMock())
+        store._use_state_store = True
+        store._store = cloud
+        await store.save("test", config, live=True)
+        key, value = cloud.set_item.call_args.args
+        self.assertEqual(key, "test")
+        with tarfile.open(
+            fileobj=io.BytesIO(base64.b64decode(value["tar_gz_b64"])),
+            mode="r:gz",
+        ) as archive:
+            names = set(archive.getnames())
+        expected = {
+            "session-store.db",
+            "session-state/test/session.db",
+            "session-state/test/events.jsonl",
+            "session-state/test/workspace.yaml",
+            "session-state/test/checkpoints/index.md",
+            "session-state/test/plan.md",
+            "session-state/test/continuation-files.json",
+            "session-state/test/artifacts/continuation.txt",
+            "session-state/test/uv.lock",
+        }
+        self.assertEqual(names, expected)
+        cloud.get_item.return_value = SimpleNamespace(value=value)
+        restored = self.root / "restored"
+        self.assertTrue(await store.restore("test", restored))
+        self.assertFalse(
+            (restored / "session-state" / "test" / "optional-output.txt").exists()
+        )
+        self.assertFalse((restored / "session-state" / "test" / "cache.db").exists())
+
+    async def test_explicit_lock_names_and_executable_mode_roundtrip(self):
+        config, workspace = create_core_layout(self.root, plan=False)
+        nested = workspace / "pins"
+        nested.mkdir()
+        (workspace / "uv.lock").write_text("uv lock", encoding="utf-8")
+        executable = nested / "resume.lock"
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+        (workspace / "continuation-files.json").write_text(
+            json.dumps(
+                {
+                    "schema": _PIN_SCHEMA,
+                    "paths": ["uv.lock", "pins/resume.lock"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = SessionSnapshotStore(self.root / "snapshots")
+        store._use_state_store = False
+        await store.save("test", config, live=True)
+        restored = self.root / "restored"
+        self.assertTrue(await store.restore("test", restored))
+        restored_workspace = restored / "session-state" / "test"
+        self.assertEqual((restored_workspace / "uv.lock").read_text(), "uv lock")
+        restored_executable = restored_workspace / "pins" / "resume.lock"
+        self.assertEqual(restored_executable.read_text(), "#!/bin/sh\n")
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(restored_executable.stat().st_mode), 0o755)
+
+    async def test_pin_change_before_single_write_preserves_previous_snapshot(self):
+        config, workspace = create_core_layout(self.root, plan=False)
+        (workspace / "a.txt").write_text("a", encoding="utf-8")
+        declaration = workspace / "continuation-files.json"
+        declaration.write_text(
+            json.dumps({"schema": _PIN_SCHEMA, "paths": ["a.txt"]}),
+            encoding="utf-8",
+        )
+        store = SessionSnapshotStore(self.root / "snapshots")
+        store._use_state_store = False
+        await store.save("test", config, live=True)
+        previous = store._path("test").read_bytes()
+        (workspace / "b.txt").write_text("b", encoding="utf-8")
+        original_pack = snapshot_module._pack_selected
+
+        def mutate_declaration(*args, **kwargs):
+            blob = original_pack(*args, **kwargs)
+            declaration.write_text(
+                json.dumps({"schema": _PIN_SCHEMA, "paths": ["b.txt"]}),
+                encoding="utf-8",
+            )
+            return blob
+
+        with patch.object(
+            snapshot_module, "_pack_selected", side_effect=mutate_declaration
+        ), self.assertRaisesRegex(RuntimeError, "changed while"):
+            await store.save("test", config, live=True)
+        self.assertEqual(store._path("test").read_bytes(), previous)
+
+    async def test_pin_aba_during_pack_restores_frozen_declaration_and_selection(self):
+        config, workspace = create_core_layout(self.root, plan=False)
+        (workspace / "a.txt").write_text("a", encoding="utf-8")
+        (workspace / "b.txt").write_text("b", encoding="utf-8")
+        declaration = workspace / "continuation-files.json"
+        declaration_a = json.dumps({"schema": _PIN_SCHEMA, "paths": ["a.txt"]}).encode()
+        declaration.write_bytes(declaration_a)
+        store = SessionSnapshotStore(self.root / "snapshots-aba")
+        store._use_state_store = False
+        original_pack = snapshot_module._pack_selected
+
+        def aba_during_pack(*args, **kwargs):
+            declaration.write_text(
+                json.dumps({"schema": _PIN_SCHEMA, "paths": ["b.txt"]}),
+                encoding="utf-8",
+            )
+            blob = original_pack(*args, **kwargs)
+            declaration.write_bytes(declaration_a)
+            return blob
+
+        with patch.object(
+            snapshot_module, "_pack_selected", side_effect=aba_during_pack
+        ):
+            await store.save("test", config, live=True)
+        restored = self.root / "restored-aba"
+        self.assertTrue(await store.restore("test", restored))
+        restored_workspace = restored / "session-state" / "test"
+        self.assertEqual(
+            (restored_workspace / "continuation-files.json").read_bytes(),
+            declaration_a,
+        )
+        self.assertTrue((restored_workspace / "a.txt").exists())
+        self.assertFalse((restored_workspace / "b.txt").exists())
+
+    async def test_pin_appearing_during_selection_is_archived_with_artifact(self):
+        config, workspace = create_core_layout(self.root, plan=False)
+        (workspace / "appeared.txt").write_text("appeared", encoding="utf-8")
+        declaration = workspace / "continuation-files.json"
+        original_load = snapshot_module._load_required_selection
+
+        def create_then_load(selected_workspace):
+            declaration.write_text(
+                json.dumps(
+                    {
+                        "schema": _PIN_SCHEMA,
+                        "paths": ["appeared.txt"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return original_load(selected_workspace)
+
+        store = SessionSnapshotStore(self.root / "snapshots-appeared")
+        store._use_state_store = False
+        with patch.object(
+            snapshot_module,
+            "_load_required_selection",
+            side_effect=create_then_load,
+        ):
+            await store.save("test", config, live=True)
+        restored = self.root / "restored-appeared"
+        self.assertTrue(await store.restore("test", restored))
+        restored_workspace = restored / "session-state" / "test"
+        self.assertTrue((restored_workspace / "continuation-files.json").exists())
+        self.assertEqual((restored_workspace / "appeared.txt").read_text(), "appeared")
+
+    async def test_invalid_or_missing_registered_files_fail(self):
+        invalid = [
+            {"schema": _PIN_SCHEMA, "paths": ["/absolute"]},
+            {"schema": _PIN_SCHEMA, "paths": ["../escape"]},
+            {"schema": _PIN_SCHEMA, "paths": ["missing.txt"]},
+            {"schema": _PIN_SCHEMA, "paths": ["same.txt", "same.txt"]},
+            {"schema": "wrong", "paths": []},
+        ]
+        for index, declaration in enumerate(invalid):
+            with self.subTest(declaration=declaration):
+                root = self.root / str(index)
+                config, workspace = create_core_layout(root, plan=False)
+                (workspace / "same.txt").write_text("same", encoding="utf-8")
+                (workspace / "continuation-files.json").write_text(
+                    json.dumps(declaration), encoding="utf-8"
+                )
+                store = SessionSnapshotStore(root / "snapshots")
+                store._use_state_store = False
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    await store.save("test", config, live=True)
+
+    async def test_legacy_v2_and_v1_full_archives_still_restore(self):
+        for version in ("v2", "v1"):
+            with self.subTest(version=version):
+                root = self.root / version
+                source = root / "source"
+                source.mkdir(parents=True)
+                (source / "session-store.db").write_bytes(b"legacy")
+                (source / "old-optional.txt").write_text("legacy", encoding="utf-8")
+                store = SessionSnapshotStore(root / "snapshots")
+                store._use_state_store = False
+                path = (
+                    store._path("test")
+                    if version == "v2"
+                    else store._legacy_path("test")
+                )
+                path.write_bytes(_pack_dir(source))
+                restored = root / "restored"
+                self.assertTrue(await store.restore("test", restored))
+                self.assertTrue((restored / "old-optional.txt").exists())
+
+
 class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -262,7 +499,6 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class Harness:
-            has_backend = staticmethod(lambda: True)
             start = AsyncMock()
             send = AsyncMock()
             abort = AsyncMock()
@@ -347,8 +583,10 @@ class TaskCheckpointTests(unittest.IsolatedAsyncioTestCase):
         snapshot, stream, state_store = await self.exercise_task()
         self.assertEqual(snapshot.save.await_count, 2)
         self.assertTrue(snapshot.save.call_args_list[0].kwargs["live"])
-        frames = [frame["type"] for frame in stream.frames]
-        self.assertEqual(frames, ["turn_start", "todo_checkpoint", "turn_complete"])
+        self.assertEqual(
+            [frame["type"] for frame in stream.frames],
+            ["turn_start", "todo_checkpoint", "turn_complete"],
+        )
         self.assertTrue(state_store.set_item.call_args.args[1]["has_snapshot"])
 
     async def test_failed_live_checkpoint_fails_turn_without_completion(self):

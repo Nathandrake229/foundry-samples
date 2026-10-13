@@ -131,6 +131,17 @@ def _validate_elicitation_id(value: Any) -> str:
     return value
 
 
+def _request_prompt(data: dict[str, Any]) -> str:
+    for field in ("input", "prompt", "message", "query"):
+        if field not in data:
+            continue
+        value = data[field]
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        return value.strip()
+    return ""
+
+
 def _session_id(request: Request) -> str:
     """Resolve the session id on any route (falls back to a query param)."""
     return request.query_params.get("agent_session_id") or getattr(
@@ -172,13 +183,10 @@ async def handle_invoke(request: Request) -> Response:
             raise ValueError("body is not a JSON object")
     except (json.JSONDecodeError, ValueError):
         data = {}
-    prompt = str(
-        data.get("input")
-        or data.get("prompt")
-        or data.get("message")
-        or data.get("query")
-        or ""
-    ).strip()
+    try:
+        prompt = _request_prompt(data)
+    except ValueError as exc:
+        return _invalid_session_response(exc)
     if not prompt:
         return JSONResponse(
             {

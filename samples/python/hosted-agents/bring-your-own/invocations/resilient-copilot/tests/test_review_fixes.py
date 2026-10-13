@@ -170,15 +170,25 @@ class SnapshotSafetyTests(unittest.IsolatedAsyncioTestCase):
         cloud = SimpleNamespace(set_item=AsyncMock())
         snapshots._store = cloud
         with patch.object(
-            snapshot_module, "_pack_dir", return_value=b"x" * (2 * 1024 * 1024)
+            SessionSnapshotStore,
+            "_snapshot_selection",
+            return_value=([], set(), set(), None, {}),
+        ), patch.object(
+            snapshot_module, "_pack_selected", return_value=b"x" * (2 * 1024 * 1024)
         ):
             await snapshots.save("test", config)
         cloud.set_item.assert_awaited_once()
 
         cloud.set_item.reset_mock()
         with patch.object(
-            snapshot_module, "_pack_dir", return_value=b"x" * (4 * 1024 * 1024)
-        ), self.assertRaisesRegex(SnapshotTooLargeError, "5 MiB serialized JSON"):
+            SessionSnapshotStore,
+            "_snapshot_selection",
+            return_value=([], set(), set(), None, {}),
+        ), patch.object(
+            snapshot_module, "_pack_selected", return_value=b"x" * (4 * 1024 * 1024)
+        ), self.assertRaisesRegex(
+            SnapshotTooLargeError, "5 MiB serialized JSON"
+        ):
             await snapshots.save("test", config)
         cloud.set_item.assert_not_awaited()
 
@@ -210,10 +220,6 @@ class SnapshotSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         config = self.root / "config"
         config.mkdir()
-        with (config / "large.bin").open("wb") as large:
-            for _ in range(80):
-                large.write(os.urandom(64 * 1024))
-
         cloud = SimpleNamespace(
             set_item=AsyncMock(),
             get_item=AsyncMock(return_value=SimpleNamespace(value=old_value)),
@@ -221,8 +227,15 @@ class SnapshotSafetyTests(unittest.IsolatedAsyncioTestCase):
         snapshots = SessionSnapshotStore(self.root / "snapshots")
         snapshots._use_state_store = True
         snapshots._store = cloud
-
-        with self.assertRaisesRegex(SnapshotTooLargeError, "5 MiB serialized JSON"):
+        with patch.object(
+            SessionSnapshotStore,
+            "_snapshot_selection",
+            return_value=([], set(), set(), None, {}),
+        ), patch.object(
+            snapshot_module, "_pack_selected", return_value=b"x" * (4 * 1024 * 1024)
+        ), self.assertRaisesRegex(
+            SnapshotTooLargeError, "5 MiB serialized JSON"
+        ):
             await snapshots.save("test", config)
         cloud.set_item.assert_not_awaited()
 
@@ -607,6 +620,13 @@ class HarnessTests(unittest.IsolatedAsyncioTestCase):
                 if not task.done()
             ):
                 break
+        self.assertFalse(
+            any(
+                "_handle_elicitation_request" in repr(task.get_coro())
+                for task in asyncio.all_tasks()
+                if not task.done()
+            )
+        )
 
 
 class FakeStream:
@@ -1302,6 +1322,14 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result["status"], "delivered_as_message")
             await asyncio.wait_for(question_2_ack, 2)
+            sent_count = len(harness.sent)
+            self.assertEqual(
+                await agent.submit_elicitation_decision(
+                    "session", "question-1", "accept", {}
+                ),
+                result,
+            )
+            self.assertEqual(len(harness.sent), sent_count)
             markers = state_store.value["elicitations"]
             self.assertEqual(markers["question-1"]["delivery"], "submitted")
             self.assertIsNone(markers["question-2"]["decision"])
@@ -1482,6 +1510,23 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(payload["action"], action)
                     if action == "accept":
                         self.assertEqual(payload["content"], {})
+                    sent_count = len(harness.sent)
+                    duplicate = await agent.submit_elicitation_decision(
+                        "session", "elicitation-1", action, content
+                    )
+                    self.assertEqual(duplicate, result)
+                    self.assertEqual(len(harness.sent), sent_count)
+                    conflicting_action = "decline" if action == "accept" else "accept"
+                    with self.assertRaisesRegex(
+                        ValueError, "different action or content"
+                    ):
+                        await agent.submit_elicitation_decision(
+                            "session",
+                            "elicitation-1",
+                            conflicting_action,
+                            {} if conflicting_action == "accept" else None,
+                        )
+                    self.assertEqual(len(harness.sent), sent_count)
                     self.assertEqual(
                         state_store.value["pending_elicitation"]["delivery"],
                         "submitted",
@@ -1489,6 +1534,146 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                     await harness.queue.put(None)
                     await task
                     self.assertIsNone(state_store.value["pending_elicitation"])
+
+    async def test_recovered_submitted_decision_retry_is_deduplicated(self):
+        receipt = {
+            "status": "delivered_as_message",
+            "elicitation_id": "elicitation-1",
+        }
+        state = {
+            "pending_elicitation": {
+                "elicitation_id": "elicitation-1",
+                "message": "Continue?",
+                "schema": {},
+                "decision": {"action": "accept", "content": {}},
+                "delivery": "submitted",
+                "receipt": receipt,
+            }
+        }
+        stream = FakeStream()
+        state_store = FakeStateStore(state)
+        snapshot = SimpleNamespace(
+            restore=AsyncMock(return_value=False), save=AsyncMock()
+        )
+        with patch.object(
+            agent, "_CONFIG_ROOT", self.root / "config-recovered-submitted"
+        ), patch.object(agent, "_SNAPSHOT_STORE", snapshot), patch.object(
+            agent, "CopilotHarness", QueueHarness
+        ), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ):
+            task = asyncio.create_task(
+                agent.copilot_agent._fn(self.context(entry_mode="recovered"))
+            )
+            while not QueueHarness.instances:
+                await asyncio.sleep(0)
+            harness = QueueHarness.instances[-1]
+            while not harness.start.await_count:
+                await asyncio.sleep(0)
+            while len(harness.sent) < 2:
+                await asyncio.sleep(0)
+            sent_count = len(harness.sent)
+            duplicate = await agent.submit_elicitation_decision(
+                "session", "elicitation-1", "accept", {}
+            )
+            self.assertEqual(duplicate, receipt)
+            self.assertEqual(len(harness.sent), sent_count)
+            with self.assertRaisesRegex(ValueError, "different action or content"):
+                await agent.submit_elicitation_decision(
+                    "session", "elicitation-1", "decline", None
+                )
+            self.assertEqual(len(harness.sent), sent_count)
+            await harness.queue.put(None)
+            await task
+
+    async def test_decision_dedupe_preserves_json_types_and_dict_key_order(self):
+        markers = {
+            question: {
+                "elicitation_id": question,
+                "message": question,
+                "schema": {},
+                "decision": None,
+            }
+            for question in ("bool-first", "int-first", "nested", "key-order")
+        }
+        state = {
+            "elicitations": markers,
+            "pending_elicitation": markers["key-order"],
+        }
+        stream = FakeStream()
+        state_store = FakeStateStore(state)
+        snapshot = SimpleNamespace(
+            restore=AsyncMock(return_value=False), save=AsyncMock()
+        )
+        with patch.object(
+            agent, "_CONFIG_ROOT", self.root / "config-json-types"
+        ), patch.object(agent, "_SNAPSHOT_STORE", snapshot), patch.object(
+            agent, "CopilotHarness", QueueHarness
+        ), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ):
+            task = asyncio.create_task(agent.copilot_agent._fn(self.context()))
+            while not QueueHarness.instances:
+                await asyncio.sleep(0)
+            harness = QueueHarness.instances[-1]
+            while not harness.start.await_count:
+                await asyncio.sleep(0)
+
+            cases = (
+                ("bool-first", {"value": True}, {"value": 1}),
+                ("int-first", {"value": 1}, {"value": True}),
+                (
+                    "nested",
+                    {"items": [{"value": True}]},
+                    {"items": [{"value": 1}]},
+                ),
+            )
+            for question, accepted, conflicting in cases:
+                receipt = await agent.submit_elicitation_decision(
+                    "session", question, "accept", accepted
+                )
+                sent_count = len(harness.sent)
+                self.assertEqual(
+                    await agent.submit_elicitation_decision(
+                        "session", question, "accept", accepted
+                    ),
+                    receipt,
+                )
+                self.assertEqual(len(harness.sent), sent_count)
+                with self.assertRaisesRegex(ValueError, "different action or content"):
+                    await agent.submit_elicitation_decision(
+                        "session", question, "accept", conflicting
+                    )
+                self.assertEqual(len(harness.sent), sent_count)
+
+            receipt = await agent.submit_elicitation_decision(
+                "session",
+                "key-order",
+                "accept",
+                {"first": 1, "second": "two"},
+            )
+            sent_count = len(harness.sent)
+            self.assertEqual(
+                await agent.submit_elicitation_decision(
+                    "session",
+                    "key-order",
+                    "accept",
+                    {"second": "two", "first": 1},
+                ),
+                receipt,
+            )
+            self.assertEqual(len(harness.sent), sent_count)
+            self.assertEqual(set(state_store.value["elicitations"]), set(markers))
+            await harness.queue.put(None)
+            await task
 
     def test_crash_hook_is_disabled_for_recovered_entry(self):
         with patch.object(agent, "_SIMULATE_CRASH_AFTER_EVENTS", 1), patch.object(
@@ -1576,6 +1761,33 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(json.loads(response.body)["error"], "invalid_request")
+
+    async def test_non_string_prompt_aliases_are_rejected_before_submission(self):
+        with patch.object(
+            main, "submit_native_input", AsyncMock()
+        ) as submit, patch.object(main.copilot_agent, "start", AsyncMock()) as start:
+            for field in ("input", "prompt", "message", "query"):
+                for value in (None, 0, False, [], {}):
+                    with self.subTest(field=field, value=value):
+                        response = await main.handle_invoke(
+                            self.request({field: value}, session_id="session")
+                        )
+                        self.assertEqual(response.status_code, 400)
+            submit.assert_not_awaited()
+            start.assert_not_awaited()
+
+    async def test_legitimate_string_prompt_aliases_are_preserved(self):
+        for field in ("input", "prompt", "message", "query"):
+            with self.subTest(field=field), patch.object(
+                main,
+                "submit_native_input",
+                AsyncMock(return_value={"status": "delivered"}),
+            ) as submit:
+                response = await main.handle_invoke(
+                    self.request({field: "  hello  "}, session_id="session")
+                )
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(submit.call_args.args[2], "hello")
 
     async def test_explicit_invalid_input_ids_are_rejected_not_regenerated(self):
         with patch.object(main.copilot_agent, "start", AsyncMock()) as start:

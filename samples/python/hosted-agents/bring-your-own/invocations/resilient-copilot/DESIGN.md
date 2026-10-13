@@ -51,9 +51,10 @@ There are three distinct persistence boundaries:
    invoke the handler after a restart. A multi-turn return suspends the task;
    it does not persist the handler's returned output.
 2. **Application state and session snapshot.** The sample saves its control
-   state in `FoundryStateStore`. A session snapshot contains the Copilot
-   configuration directory, including conversation databases, todo state,
-   `plan.md` and session artifacts. Separate invocation-keyed records preserve
+   state in `FoundryStateStore`. A required-only snapshot contains the CLI's
+   recovery databases, conversation/configuration, plan and explicitly
+   declared required artifacts. Optional outputs remain on runtime disk.
+   Separate invocation-keyed records preserve
    each turn's polling status across later turns in the same session.
 3. **Replay stream.** Copilot events are written to a file-backed stream with
    increasing sequence numbers. This is separate from the State Store snapshot;
@@ -71,8 +72,9 @@ another Foundry turn or another independently decorated task.
 
 The pinned Copilot CLI exposes a session workspace containing `session.db`.
 After a tool finishes, the sample compares committed `todos` and `todo_deps`
-rows and `plan.md` against the last acknowledged state. If they changed, the
-hook requests a snapshot and waits for persistence acknowledgement.
+rows, `plan.md`, the required-file declaration and declared file contents
+against the last acknowledged state. If they changed, the hook requests a
+snapshot and waits for persistence acknowledgement.
 
 The task consumer performs the write in its execution context, then emits
 `todo_checkpoint`. This is important because the Copilot SDK logs hook errors
@@ -84,13 +86,38 @@ Live snapshots use SQLite's online backup API, rather than copying active DB
 and WAL files. Database sidecars and process lock files are excluded from live
 archives, and incomplete JSONL tails are omitted.
 
-Only the per-session Copilot configuration/workspace tree is archived.
-Arbitrary files in `/tmp` or other working directories require their own
-durable storage; restoring the Copilot plan does not restore those files.
+Only the known CLI recovery files and declared required workspace files are
+stored. The declaration is
+`session-state/<session_id>/continuation-files.json`, with schema
+`copilot-continuation-files/v1` and an array of workspace-relative regular-file
+paths. Missing, escaping or symlink paths fail explicitly. Optional outputs,
+caches and diagnostics stay on runtime disk; there is no persistent-disk
+guarantee. Files outside this workspace require their own durable storage.
 
 Each SQLite database is consistent independently. The archive is not a single
 transaction across all files, and it cannot make outside tool effects exactly
 once.
+
+### One required-only archive
+
+Keep the original `copilot-session-snapshots-v2` store and its single
+`tar_gz_b64` value per session. File selection changes, not the persistence
+protocol: consistent database backups, recovery history/configuration, plan
+state and declared continuation artifacts share one archive.
+
+The required-file declaration and selected files must agree. A checkpoint
+must not archive a changed declaration pointing at files it did not select.
+Explicitly required files such as `uv.lock` are not mistaken for CLI process
+locks, and executables retain their file modes.
+
+All packing and validation completes before the one State Store write. Failure
+preserves the prior saved snapshot; success acknowledges that write. Offline
+mode uses the same archive with atomic local replacement. The archive format
+and v2/v1 read fallback remain compatible with existing snapshots. New writes
+omit unregistered optional data, even after restoring an older full archive.
+
+Control/HITL receipts and invocation status remain in their existing stores.
+There are no new category stores, multi-item manifests or generation pointers.
 
 ### Value size and retention
 
@@ -99,8 +126,10 @@ value offload is enabled, the service transparently stores larger values as
 managed Dataset versions backed by blobs, up to a 5 MiB serialized JSON maximum.
 Reads hydrate the original JSON through the same State Store API.
 
-The snapshot archive is compressed and base64-encoded; its JSON size, including
-base64 overhead, must stay within that maximum. The sample does not provision
+The archive is compressed and base64-encoded; its JSON size, including
+base64 and JSON overhead, must stay within that maximum. Task attachments
+have a separate 10 MiB limit; it does not apply to State Store values.
+The sample does not provision
 Blob Storage or call Dataset APIs directly. A deployment with offload disabled
 can reject values above 1 MiB, and values above 5 MiB require another application
 storage design. Persistence failures must not be reported as completed work.
@@ -170,6 +199,10 @@ decision. Keep the accepted decision replayable until a valid session idle
 boundary. An unrelated todo checkpoint does not confirm a decision. Question
 updates must be serialized, and completing one decision must not erase a
 different pending question.
+
+An identical retry of a submitted decision returns its existing receipt rather
+than delivering another message. A conflicting action or content for that
+question is rejected before modifying the accepted decision.
 
 The per-turn watchdog remains applicable while the handler is running or
 parked on an elicitation. The sample is not an unlimited human-wait workflow

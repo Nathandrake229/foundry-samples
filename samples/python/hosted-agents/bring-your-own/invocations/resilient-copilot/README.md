@@ -70,7 +70,7 @@ long-running-agent capabilities** end-to-end on a genuine agent loop.
 | `POST /invocations` `{"input": "...", "mode": "immediate"\|"enqueue"?}` | Start (or resume) a turn; if a turn is already live, **steer** (`immediate`) or **queue** (`enqueue`) it. Returns `202` JSON, or a live SSE stream when `Accept: text/event-stream`. |
 | `GET /invocations/{id}` (`Accept: text/event-stream`, optional `?last_event_id=N`) | Reconnectable SSE; the file-backed replay serves the gap after a drop/crash before live-tailing. |
 | `GET /invocations/{id}` (no SSE header) | Invocation-scoped JSON status/result; earlier IDs do not report a later turn's state. |
-| `POST /elicit` `{"session_id","elicitation_id","action","content"?}` | Answer a human-in-the-loop pause (`action`: `accept`\|`decline`\|`cancel`). |
+| `POST /elicit?agent_session_id=<sid>` `{"session_id","elicitation_id","action","content"?}` | Answer a human-in-the-loop pause. Body session must match the resolved caller/hosted session; a mismatch is rejected. |
 | `POST /invocations/{id}/cancel` | Abort the specified active invocation, not a later turn in the same session. |
 
 ## Environment Variables
@@ -166,10 +166,15 @@ When the model raises an elicitation, the stream carries an
 `elicitation_request` event with an `elicitation_id`. Answer it:
 
 ```bash
-curl -X POST http://localhost:8088/elicit \
+curl -X POST "http://localhost:8088/elicit?agent_session_id=<sid>" \
   -H "Content-Type: application/json" \
   -d '{"session_id": "<sid>", "elicitation_id": "<eid>", "action": "accept", "content": {"approved": true}}'
 ```
+
+The request's resolved session and the body `session_id` must agree. The custom
+route uses the host's configured session when present; local callers supply
+`agent_session_id`. A body ID cannot select another session or substitute for
+missing caller context.
 
 ## Testing crash recovery
 

@@ -198,6 +198,10 @@ Future is gone, so the sample must validate the reply against the durable
 question ID and preserve its action and optional content.
 
 `accept` with empty content, `decline` and `cancel` are valid decisions.
+Before routing, validate the body session against the request's resolved
+session. The custom `/elicit` route binds to the configured hosted session, or
+the local `agent_session_id` query parameter when no host session is configured;
+body data cannot override this binding.
 Unknown or stale question IDs must not be injected into another question's
 conversation. A recovered decision can be delivered as a structured message
 when the original Future no longer exists; the question may be asked again.

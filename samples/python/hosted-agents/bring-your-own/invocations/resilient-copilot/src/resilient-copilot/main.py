@@ -385,6 +385,11 @@ async def handle_elicit(request: Request) -> Response:
     try:
         data = await request.json()
         session_id = validate_session_id(data["session_id"])
+        if not hasattr(request.state, "session_id"):
+            request.state.session_id = (
+                app.config.session_id or request.query_params.get("agent_session_id")
+            )
+        caller_session_id = validate_session_id(request.state.session_id)
         elicitation_id = _validate_elicitation_id(data["elicitation_id"])
         action = str(data.get("action", "accept"))
         content = data.get("content")
@@ -400,6 +405,14 @@ async def handle_elicit(request: Request) -> Response:
                 ),
             },
             status_code=400,
+        )
+    if session_id != caller_session_id:
+        return JSONResponse(
+            {
+                "error": "forbidden",
+                "message": "session_id must match the caller's resolved session.",
+            },
+            status_code=403,
         )
     if action not in ("accept", "decline", "cancel"):
         return JSONResponse(

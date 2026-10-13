@@ -2256,11 +2256,86 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
                             "session_id": session_id,
                             "elicitation_id": "question",
                             "action": "accept",
-                        }
+                        },
+                        session_id=session_id,
                     )
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(submit.await_args.args[0], session_id)
+
+    async def test_elicitation_rejects_other_or_invalid_caller_sessions(self):
+        with patch.object(main, "submit_elicitation_decision", AsyncMock()) as submit:
+            for action in ("accept", "decline", "cancel"):
+                with self.subTest(action=action):
+                    response = await main.handle_elicit(
+                        self.request(
+                            {
+                                "session_id": "other-session",
+                                "elicitation_id": "question",
+                                "action": action,
+                            },
+                            session_id="caller-session",
+                        )
+                    )
+                    self.assertEqual(response.status_code, 403)
+            for caller in (None, 123, "", "../escape"):
+                with self.subTest(caller=caller):
+                    response = await main.handle_elicit(
+                        self.request(
+                            {
+                                "session_id": "session",
+                                "elicitation_id": "question",
+                                "action": "accept",
+                            },
+                            session_id=caller,
+                        )
+                    )
+                    self.assertEqual(response.status_code, 400)
+            submit.assert_not_awaited()
+
+    async def test_elicit_custom_route_resolves_session_without_body_fallback(self):
+        import httpx
+
+        body = {
+            "session_id": "session",
+            "elicitation_id": "question",
+            "action": "accept",
+        }
+        with patch.object(main.app.config, "session_id", ""), patch.object(
+            main,
+            "submit_elicitation_decision",
+            AsyncMock(return_value={"status": "answered"}),
+        ) as submit:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=main.app),
+                base_url="http://localhost",
+            ) as client:
+                missing = await client.post("/elicit", json=body)
+                self.assertEqual(missing.status_code, 400)
+                mismatch = await client.post(
+                    "/elicit?agent_session_id=other-session", json=body
+                )
+                self.assertEqual(mismatch.status_code, 403)
+                matching = await client.post(
+                    "/elicit?agent_session_id=session", json=body
+                )
+                self.assertEqual(matching.status_code, 200)
+                submit.assert_awaited_once_with("session", "question", "accept", None)
+                submit.reset_mock()
+                with patch.object(main.app.config, "session_id", "hosted-session"):
+                    override = await client.post(
+                        "/elicit?agent_session_id=session", json=body
+                    )
+                    self.assertEqual(override.status_code, 403)
+                    submit.assert_not_awaited()
+                    matching_hosted = await client.post(
+                        "/elicit?agent_session_id=session",
+                        json={**body, "session_id": "hosted-session"},
+                    )
+                    self.assertEqual(matching_hosted.status_code, 200)
+                    submit.assert_awaited_once_with(
+                        "hosted-session", "question", "accept", None
+                    )
 
     async def test_non_string_elicitation_ids_are_rejected(self):
         with patch.object(main, "submit_elicitation_decision", AsyncMock()) as submit:

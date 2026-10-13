@@ -171,10 +171,14 @@ def reserve_harness(session_id: str) -> _HarnessSlot:
     return slot
 
 
-def fail_harness_start(session_id: str, exc: BaseException) -> None:
+def fail_harness_start(
+    session_id: str,
+    exc: BaseException,
+    expected_slot: _HarnessSlot | None = None,
+) -> None:
     """Unblock rapid follow-ups when starting the durable task failed."""
     slot = _HARNESS_SLOTS.get(session_id)
-    if slot is None:
+    if slot is None or (expected_slot is not None and slot is not expected_slot):
         return
     slot.closing = True
     if not slot.ready.done():

@@ -237,9 +237,9 @@ async def handle_invoke(request: Request) -> Response:
 
     # No readied live harness (including closing/idle races): start or queue a
     # framework-durable turn instead of touching a missing Copilot session.
-    stream = await streams.get_or_create(invocation_id)
-    reserve_harness(session_id)
+    slot = reserve_harness(session_id)
     try:
+        stream = await streams.get_or_create(invocation_id)
         await copilot_agent.start(
             task_id=task_id,
             input={
@@ -252,7 +252,7 @@ async def handle_invoke(request: Request) -> Response:
             },
         )
     except BaseException as exc:
-        fail_harness_start(session_id, exc)
+        fail_harness_start(session_id, exc, slot)
         raise
 
     if "text/event-stream" in request.headers.get("accept", ""):

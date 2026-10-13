@@ -455,6 +455,36 @@ class RequiredOnlySnapshotTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises((ValueError, FileNotFoundError)):
                     await store.save("test", config, live=True)
 
+    async def test_broken_declaration_symlink_is_not_treated_as_absent(self):
+        config, workspace = create_core_layout(self.root, plan=False)
+        declaration = workspace / "continuation-files.json"
+        store = SessionSnapshotStore(self.root / "snapshots-broken-declaration")
+        store._use_state_store = False
+        original_is_symlink = Path.is_symlink
+        original_exists = Path.exists
+        with patch.object(
+            Path,
+            "is_symlink",
+            autospec=True,
+            side_effect=lambda path: (path == declaration or original_is_symlink(path)),
+        ), patch.object(
+            Path,
+            "exists",
+            autospec=True,
+            side_effect=lambda path: (
+                False if path == declaration else original_exists(path)
+            ),
+        ), patch.object(
+            Path,
+            "read_bytes",
+            autospec=True,
+            side_effect=AssertionError("broken declaration target must not be read"),
+        ), self.assertRaisesRegex(
+            ValueError, "must be a regular file"
+        ):
+            await store.save("test", config, live=True)
+        self.assertFalse(store._path("test").exists())
+
     async def test_legacy_v2_and_v1_full_archives_still_restore(self):
         for version in ("v2", "v1"):
             with self.subTest(version=version):

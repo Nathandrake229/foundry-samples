@@ -2063,6 +2063,10 @@ class StartupEnvironmentTests(unittest.TestCase):
 
 
 class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        agent._HARNESS_SLOTS.clear()
+        self.addCleanup(agent._HARNESS_SLOTS.clear)
+
     @staticmethod
     def request(
         body=None,
@@ -2238,6 +2242,134 @@ class HttpValidationTests(unittest.IsolatedAsyncioTestCase):
             response = await main.handle_invoke(request)
         self.assertEqual(response.status_code, 202)
         self.assertEqual(json.loads(response.body)["action"], "start")
+        start.assert_awaited_once()
+
+    async def test_concurrent_first_requests_reserve_before_stream_await(self):
+        stream_entered = asyncio.Event()
+        stream_release = asyncio.Event()
+        harness = SimpleNamespace(
+            queue_input=AsyncMock(
+                return_value={
+                    "status": "delivered",
+                    "input_id": "same-id",
+                    "deduplicated": True,
+                }
+            )
+        )
+
+        async def get_stream(_invocation_id):
+            stream_entered.set()
+            await stream_release.wait()
+            return SimpleNamespace()
+
+        async def start_task(**_kwargs):
+            slot = agent._HARNESS_SLOTS["session"]
+            if not slot.ready.done():
+                slot.ready.set_result(harness)
+
+        with patch.object(
+            main.streams, "get_or_create", side_effect=get_stream
+        ) as get_or_create, patch.object(
+            main.copilot_agent, "start", side_effect=start_task
+        ) as start:
+            first = asyncio.create_task(
+                main.handle_invoke(
+                    self.request(
+                        {"input": "hello", "input_id": "same-id"},
+                        session_id="session",
+                        invocation_id="first",
+                    )
+                )
+            )
+            await stream_entered.wait()
+            second = asyncio.create_task(
+                main.handle_invoke(
+                    self.request(
+                        {"input": "hello", "input_id": "same-id"},
+                        session_id="session",
+                        invocation_id="second",
+                    )
+                )
+            )
+            await asyncio.sleep(0)
+            start.assert_not_awaited()
+            stream_release.set()
+            first_response, second_response = await asyncio.gather(first, second)
+
+        self.assertEqual(json.loads(first_response.body)["action"], "start")
+        self.assertEqual(json.loads(second_response.body)["action"], "queue")
+        start.assert_awaited_once()
+        get_or_create.assert_awaited_once_with("first")
+        harness.queue_input.assert_awaited_once_with("same-id", "hello", "enqueue")
+
+    async def test_stream_start_failure_wakes_followers_and_allows_fresh_reservation(
+        self,
+    ):
+        stream_entered = asyncio.Event()
+        stream_release = asyncio.Event()
+        calls = 0
+        replacement_harness = SimpleNamespace(queue_input=AsyncMock())
+
+        async def get_stream(_invocation_id):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                stream_entered.set()
+                await stream_release.wait()
+                raise OSError("stream creation failed")
+            return SimpleNamespace()
+
+        async def start_task(**_kwargs):
+            slot = agent._HARNESS_SLOTS["session"]
+            if not slot.ready.done():
+                slot.ready.set_result(replacement_harness)
+
+        with patch.object(
+            main.streams, "get_or_create", side_effect=get_stream
+        ), patch.object(main.copilot_agent, "start", side_effect=start_task) as start:
+            first = asyncio.create_task(
+                main.handle_invoke(
+                    self.request(
+                        {"input": "first", "input_id": "first-id"},
+                        session_id="session",
+                        invocation_id="first",
+                    )
+                )
+            )
+            await stream_entered.wait()
+            follower = asyncio.create_task(
+                main.handle_invoke(
+                    self.request(
+                        {"input": "follow", "input_id": "follow-id"},
+                        session_id="session",
+                        invocation_id="follower",
+                    )
+                )
+            )
+            stream_release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(first, follower, return_exceptions=True),
+                2,
+            )
+            self.assertTrue(
+                all(
+                    isinstance(outcome, OSError)
+                    and str(outcome) == "stream creation failed"
+                    for outcome in outcomes
+                )
+            )
+            self.assertNotIn("session", agent._HARNESS_SLOTS)
+
+            retry = await main.handle_invoke(
+                self.request(
+                    {"input": "retry", "input_id": "retry-id"},
+                    session_id="session",
+                    invocation_id="retry",
+                )
+            )
+
+        self.assertEqual(retry.status_code, 202)
+        self.assertEqual(json.loads(retry.body)["action"], "start")
         start.assert_awaited_once()
 
     async def test_polling_old_invocation_stays_terminal_during_new_turn(self):

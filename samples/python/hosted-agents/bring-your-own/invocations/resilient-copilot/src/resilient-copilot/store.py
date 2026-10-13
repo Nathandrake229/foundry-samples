@@ -152,9 +152,11 @@ def _load_required_selection(
     workspace: Path,
 ) -> tuple[list[PurePosixPath], bytes | None]:
     manifest_path = workspace / _PIN_FILENAME
+    if manifest_path.is_symlink():
+        raise ValueError(f"{_PIN_FILENAME} must be a regular file")
     if not manifest_path.exists():
         return [], None
-    if manifest_path.is_symlink() or not manifest_path.is_file():
+    if not manifest_path.is_file():
         raise ValueError(f"{_PIN_FILENAME} must be a regular file")
     declaration = manifest_path.read_bytes()
     value = json.loads(declaration)

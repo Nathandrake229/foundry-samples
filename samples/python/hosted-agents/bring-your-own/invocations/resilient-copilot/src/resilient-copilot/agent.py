@@ -326,6 +326,53 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
         _sync_pending_elicitation(state)
         if legacy_state_migrated:
             await state_store.set_item("state", state)
+
+        incoming_input_id = ctx.input.get("input_id")
+        incoming_mode = ctx.input.get("mode") or "enqueue"
+        if incoming_input_id is not None:
+            journal = _input_journal(state)
+            incoming_record = next(
+                (
+                    record
+                    for record in journal
+                    if record.get("input_id") == incoming_input_id
+                ),
+                None,
+            )
+            if incoming_record is not None and (
+                incoming_record.get("prompt") != prompt
+                or incoming_record.get("mode") != incoming_mode
+            ):
+                raise ValueError(
+                    "input_id is already bound to a different prompt or mode"
+                )
+            if incoming_record is None:
+                unfinished = [
+                    record for record in journal if record.get("status") != "covered"
+                ]
+                if len(unfinished) >= _MAX_INPUT_JOURNAL_ENTRIES:
+                    raise RuntimeError(
+                        "Durable native-input journal is full; wait for the "
+                        "current Copilot turn to reach idle before retrying."
+                    )
+                incoming_record = {
+                    "input_id": incoming_input_id,
+                    "prompt": prompt,
+                    "mode": incoming_mode,
+                    "status": "accepted",
+                }
+                journal.append(incoming_record)
+                journal_size = len(
+                    json.dumps(journal, separators=(",", ":")).encode("utf-8")
+                )
+                if journal_size > _MAX_INPUT_JOURNAL_BYTES:
+                    journal.pop()
+                    raise ValueError(
+                        "Durable native-input journal would exceed 512 KiB; "
+                        "send a smaller input or wait for the current turn to "
+                        "reach idle."
+                    )
+                await state_store.set_item("state", state)
         await _INVOCATION_STORE.put(
             inv_id,
             task_id=task_id,
@@ -401,11 +448,13 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                         request.acknowledged.set_exception(error)
                     return
                 if record is not None and record.get("status") == "delivered":
-                    result = {
-                        "status": "delivered",
-                        "input_id": request.input_id,
-                        "deduplicated": True,
-                    }
+                    receipt = record.get("receipt")
+                    if not isinstance(receipt, dict):
+                        receipt = {
+                            "status": "delivered",
+                            "input_id": request.input_id,
+                        }
+                    result = {**receipt, "deduplicated": True}
                 else:
                     if record is None:
                         unfinished = [
@@ -449,10 +498,13 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     )
                     await save_snapshot(live=True)
                     record["status"] = "delivered"
-                    await persist_state()
-                    result = {
+                    record["receipt"] = {
                         "status": "delivered",
                         "input_id": request.input_id,
+                    }
+                    await persist_state()
+                    result = {
+                        **record["receipt"],
                         "deduplicated": False,
                     }
                 if not request.acknowledged.done():
@@ -592,8 +644,6 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                     }
                 )
 
-        incoming_input_id = ctx.input.get("input_id")
-        incoming_mode = ctx.input.get("mode") or "enqueue"
         incoming_record = next(
             (
                 record
@@ -622,6 +672,10 @@ async def copilot_agent(ctx: TaskContext[dict]) -> None:
                 )
                 await save_snapshot(live=True)
                 record["status"] = "delivered"
+                record["receipt"] = {
+                    "status": "delivered",
+                    "input_id": record["input_id"],
+                }
                 await persist_state()
 
         for marker in list(_elicitations(state).values()):

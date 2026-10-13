@@ -1128,6 +1128,94 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    async def test_initial_input_is_reserved_before_ready_and_retries_deduplicate(self):
+        log = []
+        QueueHarness.start_gate = asyncio.Event()
+        QueueHarness.log = log
+        state_store = FakeStateStore({}, log)
+        snapshot = SimpleNamespace(
+            restore=AsyncMock(return_value=False),
+            save=AsyncMock(side_effect=lambda *args, **kwargs: log.append("snapshot")),
+        )
+        stream = FakeStream()
+        context = self.context(
+            native_input_id="initial-id",
+            prompt="initial prompt",
+            mode="immediate",
+        )
+        with patch.object(
+            agent, "_CONFIG_ROOT", self.root / "config-initial-reservation"
+        ), patch.object(agent, "_SNAPSHOT_STORE", snapshot), patch.object(
+            agent, "CopilotHarness", QueueHarness
+        ), patch.object(
+            agent.streams, "get_or_create", AsyncMock(return_value=stream)
+        ), patch.object(
+            agent.FoundryStateStore,
+            "get_or_create",
+            AsyncMock(return_value=state_store),
+        ), patch.object(
+            agent, "_get_legacy_state_item", AsyncMock(return_value=None)
+        ):
+            task = asyncio.create_task(agent.copilot_agent._fn(context))
+            while "input_journal" not in (state_store.value or {}):
+                await asyncio.sleep(0)
+            record = state_store.value["input_journal"][0]
+            self.assertEqual(
+                record,
+                {
+                    "input_id": "initial-id",
+                    "prompt": "initial prompt",
+                    "mode": "immediate",
+                    "status": "accepted",
+                },
+            )
+            retry_before_ready = asyncio.create_task(
+                agent.submit_native_input(
+                    "session", "initial-id", "initial prompt", "immediate"
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(retry_before_ready.done())
+            QueueHarness.start_gate.set()
+            before_receipt = await asyncio.wait_for(retry_before_ready, 2)
+            self.assertEqual(
+                before_receipt,
+                {
+                    "status": "delivered",
+                    "input_id": "initial-id",
+                    "deduplicated": True,
+                },
+            )
+            harness = QueueHarness.instances[-1]
+            self.assertEqual(harness.sent, [("initial prompt", "immediate")])
+            after_receipt = await agent.submit_native_input(
+                "session", "initial-id", "initial prompt", "immediate"
+            )
+            self.assertEqual(after_receipt, before_receipt)
+            self.assertEqual(harness.sent, [("initial prompt", "immediate")])
+
+            for prompt, mode in (
+                ("different prompt", "immediate"),
+                ("initial prompt", "enqueue"),
+            ):
+                with self.subTest(prompt=prompt, mode=mode), self.assertRaisesRegex(
+                    ValueError, "different prompt or mode"
+                ):
+                    await agent.submit_native_input(
+                        "session", "initial-id", prompt, mode
+                    )
+            self.assertEqual(
+                state_store.value["input_journal"][0]["prompt"],
+                "initial prompt",
+            )
+            self.assertEqual(
+                state_store.value["input_journal"][0]["mode"],
+                "immediate",
+            )
+            self.assertEqual(harness.sent, [("initial prompt", "immediate")])
+            await harness.queue.put(None)
+            await task
+
     async def test_idle_queued_during_acceptance_does_not_cover_native_input(self):
         harness = CopilotHarness()
         idle = SimpleNamespace(type=SessionEventType.SESSION_IDLE)
@@ -1428,6 +1516,44 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         harness = ImmediateHarness.instances[-1]
         self.assertEqual(harness.sent, [("accepted prompt", "enqueue")])
+
+    async def test_recovery_replays_initial_record_only_once_for_each_status(self):
+        for status in ("accepted", "delivered"):
+            with self.subTest(status=status):
+                agent._HARNESS_SLOTS.clear()
+                ImmediateHarness.instances.clear()
+                record = {
+                    "input_id": "initial-id",
+                    "prompt": "initial prompt",
+                    "mode": "enqueue",
+                    "status": status,
+                }
+                if status == "delivered":
+                    record["receipt"] = {
+                        "status": "delivered",
+                        "input_id": "initial-id",
+                    }
+                state = {"input_journal": [record]}
+
+                async def restore(_session_id, config_dir):
+                    config_dir.mkdir(parents=True)
+                    (config_dir / "session-store.db").write_bytes(b"db")
+                    return True
+
+                await self.run_task(
+                    context=self.context(
+                        entry_mode="recovered",
+                        native_input_id="initial-id",
+                        prompt="initial prompt",
+                        mode="enqueue",
+                    ),
+                    state=state,
+                    restore_side_effect=restore,
+                )
+                self.assertEqual(
+                    ImmediateHarness.instances[-1].sent,
+                    [("initial prompt", "enqueue")],
+                )
 
     async def test_existing_accepted_input_rejects_prompt_and_mode_conflicts(self):
         state = {
